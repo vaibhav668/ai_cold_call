@@ -23,8 +23,7 @@ async def lifespan(app: FastAPI):
         run_db_diagnostics()
         await verify_db_connection()
     except Exception as e:
-        logger.critical(f"Database configuration validation failed! Aborting startup. Error: {e}")
-        raise e
+        logger.critical(f"Database configuration validation failed! Web server will continue booting. Error: {e}")
 
     logger.info("Initializing external service connection pools...")
     chroma_manager.connect()
