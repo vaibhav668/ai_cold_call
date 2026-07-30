@@ -18,13 +18,16 @@ from app.core.exceptions import (
     DatabaseAuthenticationError,
     DatabaseTimeoutError,
     DatabaseConnectionPoolError,
-    DatabaseException,
 )
+
+# Global lazy-loaded database engine and session maker
+_engine = None
+_async_session_maker = None
 
 def resolve_db_host(hostname: str) -> str:
     """Resolves database hostname to IPv4 address specifically to avoid IPv6 unreachable network errors."""
     try:
-        # Get address info for IPv4 (socket.AF_INET) to force IPv4
+        # Get address info for IPv4 (socket.AF_INET) to force IPv4 connection routes
         addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET)
         if addr_info:
             ipv4_address = addr_info[0][4][0]
@@ -34,6 +37,65 @@ def resolve_db_host(hostname: str) -> str:
         logger.error(f"DNS Resolution failed for host '{hostname}': {e}")
         raise DatabaseDNSResolveError(f"DNS Resolution failed for host '{hostname}'. Verify hostname or internet connection.")
     return hostname
+
+def get_engine():
+    """Lazy-initialize the SQLAlchemy async engine after startup to ensure network interface is active."""
+    global _engine
+    if _engine is None:
+        parsed_url = urlparse(settings.DATABASE_URL)
+        original_host = parsed_url.hostname
+        connect_args: Dict[str, Any] = {}
+
+        if original_host:
+            # Resolve host to IPv4
+            try:
+                resolved_ip = resolve_db_host(original_host)
+            except DatabaseDNSResolveError as e:
+                import sys
+                is_testing = "pytest" in sys.modules or settings.APP_ENV == "testing"
+                if is_testing:
+                    logger.warning("Bypassing DNS Resolution failure in get_engine during testing.")
+                    resolved_ip = original_host
+                else:
+                    raise e
+            
+            # Reconstruct DATABASE_URL with resolved IPv4
+            if original_host != resolved_ip:
+                netloc = parsed_url.netloc
+                new_netloc = netloc.replace(original_host, resolved_ip, 1)
+                db_url = parsed_url._replace(netloc=new_netloc).geturl()
+            else:
+                db_url = settings.DATABASE_URL
+                
+            # Set connection ssl arguments for remote database instances
+            if original_host not in ("localhost", "127.0.0.1"):
+                connect_args["ssl"] = "require"
+                if original_host != resolved_ip:
+                    connect_args["server_hostname"] = original_host
+        else:
+            db_url = settings.DATABASE_URL
+
+        logger.info(f"Creating database engine with resolved URL: {db_url.split('@')[-1]}")
+        _engine = create_async_engine(
+            db_url,
+            echo=settings.DEBUG and not settings.is_production,
+            pool_pre_ping=True,      # Checks connection liveness before checking it out
+            pool_size=10,            # Standard connections to keep open in the pool
+            max_overflow=20,         # Max extra connections beyond pool_size
+            connect_args=connect_args
+        )
+    return _engine
+
+def get_session_maker():
+    """Lazy-initialize the async session maker."""
+    global _async_session_maker
+    if _async_session_maker is None:
+        _async_session_maker = async_sessionmaker(
+            bind=get_engine(),
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+    return _async_session_maker
 
 def run_db_diagnostics() -> None:
     """Runs comprehensive network diagnostics on startup for the configured database."""
@@ -122,59 +184,13 @@ def run_db_diagnostics() -> None:
     logger.info(f"Environment: {settings.APP_ENV}")
     logger.info("============================")
 
-# Parse database connection URL and resolve host to force IPv4
-parsed_url = urlparse(settings.DATABASE_URL)
-original_host = parsed_url.hostname
-connect_args: Dict[str, Any] = {}
-
-if original_host:
-    # Resolve host to IPv4
-    try:
-        resolved_ip = resolve_db_host(original_host)
-    except DatabaseDNSResolveError:
-        # If offline or DNS fails during import/dry-run, fallback to original host
-        resolved_ip = original_host
-        
-    # Reconstruct DATABASE_URL with resolved IPv4 to prevent OSError [Errno 101] Network is unreachable
-    if original_host != resolved_ip:
-        netloc = parsed_url.netloc
-        new_netloc = netloc.replace(original_host, resolved_ip, 1)
-        db_url = parsed_url._replace(netloc=new_netloc).geturl()
-    else:
-        db_url = settings.DATABASE_URL
-        
-    # Set connection ssl arguments for remote database instances (e.g. Supabase)
-    if original_host not in ("localhost", "127.0.0.1"):
-        connect_args["ssl"] = "require"
-        # server_hostname is required for verifying certificate when connecting via IP address
-        if original_host != resolved_ip:
-            connect_args["server_hostname"] = original_host
-else:
-    db_url = settings.DATABASE_URL
-
-# Create async engine with robust pool configuration and IPv4 force-overrides
-engine = create_async_engine(
-    db_url,
-    echo=settings.DEBUG and not settings.is_production,
-    pool_pre_ping=True,      # Checks connection liveness before checking it out
-    pool_size=10,            # Standard connections to keep open in the pool
-    max_overflow=20,         # Max extra connections beyond pool_size
-    connect_args=connect_args
-)
-
-# Async session maker
-async_session_maker = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
-
 async def verify_db_connection() -> None:
     """Verify that database credentials are valid and SELECT 1 query executes successfully."""
     import sys
     is_testing = "pytest" in sys.modules or settings.APP_ENV == "testing"
     try:
-        async with async_session_maker() as session:
+        session_maker = get_session_maker()
+        async with session_maker() as session:
             await session.execute(text("SELECT 1"))
         logger.info("Database Authentication & Execution: SUCCESS")
     except Exception as e:
@@ -189,7 +205,8 @@ async def verify_db_connection() -> None:
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Dependency injection generator for async database sessions."""
-    async with async_session_maker() as session:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
         try:
             yield session
         except Exception as e:

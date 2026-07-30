@@ -33,8 +33,8 @@ async def lifespan(app: FastAPI):
     # Shutdown hook: Clean up pools
     logger.info("Shutting down external service connection pools...")
     # Clean up engine connection pool
-    from app.db.session import engine
-    await engine.dispose()
+    from app.db.session import get_engine
+    await get_engine().dispose()
     logger.info("Database connection pool disposed.")
 
 app = FastAPI(

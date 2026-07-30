@@ -73,8 +73,8 @@ async def database_health_check(db: AsyncSession = Depends(get_db_session)):
 
     try:
         # 1. Verify SQLAlchemy engine is instantiated
-        from app.db.session import engine
-        if engine is not None:
+        from app.db.session import get_engine
+        if get_engine() is not None:
             engine_healthy = True
 
         # 2. Verify session creation
