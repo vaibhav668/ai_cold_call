@@ -58,3 +58,50 @@ async def health_check(db: AsyncSession = Depends(get_db_session)):
             "chromadb": chromadb_status
         }
     }
+
+from fastapi.responses import JSONResponse
+
+@router.get("/health/database", status_code=status.HTTP_200_OK)
+async def database_health_check(db: AsyncSession = Depends(get_db_session)):
+    """Verifies detailed database connectivity (reachable, engine healthy, session creation, SELECT 1 query)."""
+    db_reachable = False
+    engine_healthy = False
+    session_created = False
+    query_executed = False
+    error_detail = None
+    status_code = status.HTTP_200_OK
+
+    try:
+        # 1. Verify SQLAlchemy engine is instantiated
+        from app.db.session import engine
+        if engine is not None:
+            engine_healthy = True
+
+        # 2. Verify session creation
+        if db is not None:
+            session_created = True
+
+        # 3. Verify SELECT 1 query executes & database is reachable
+        await db.execute(text("SELECT 1"))
+        db_reachable = True
+        query_executed = True
+        overall_status = "healthy"
+    except Exception as e:
+        logger.error(f"Detailed database health check failed: {e}")
+        error_detail = str(e)
+        overall_status = "unhealthy"
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": overall_status,
+            "checks": {
+                "database_reachable": db_reachable,
+                "engine_healthy": engine_healthy,
+                "session_created": session_created,
+                "query_executed": query_executed
+            },
+            "error": error_detail
+        }
+    )

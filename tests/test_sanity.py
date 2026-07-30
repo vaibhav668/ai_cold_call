@@ -41,3 +41,30 @@ async def test_health_endpoint(client: AsyncClient, monkeypatch):
     assert data["services"]["chromadb"] == "healthy"
     
     app.dependency_overrides.clear()
+
+@pytest.mark.anyio
+async def test_database_health_endpoint(client: AsyncClient):
+    from app.db.session import get_db_session
+    class MockDbSession:
+        async def execute(self, statement):
+            return None
+        async def rollback(self):
+            pass
+        async def close(self):
+            pass
+            
+    async def mock_db_session():
+        yield MockDbSession()
+        
+    app.dependency_overrides[get_db_session] = mock_db_session
+    
+    response = await client.get("/api/v1/health/database")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+    assert data["checks"]["database_reachable"] is True
+    assert data["checks"]["engine_healthy"] is True
+    assert data["checks"]["session_created"] is True
+    assert data["checks"]["query_executed"] is True
+    
+    app.dependency_overrides.clear()

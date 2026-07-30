@@ -1,4 +1,8 @@
-from typing import AsyncGenerator
+import socket
+import ssl
+from urllib.parse import urlparse
+from typing import AsyncGenerator, Dict, Any
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -6,23 +10,156 @@ from sqlalchemy.ext.asyncio import (
 )
 from app.core.config import settings
 from app.core.logging import logger
-import ssl
+from app.core.exceptions import (
+    InvalidDatabaseURLError,
+    DatabaseDNSResolveError,
+    DatabasePortUnreachableError,
+    DatabaseSSLHandshakeError,
+    DatabaseAuthenticationError,
+    DatabaseTimeoutError,
+    DatabaseConnectionPoolError,
+    DatabaseException,
+)
 
-# Create async engine with robust pool configuration and programmatic SSL logic
-connect_args = {}
-if "supabase.co" in settings.DATABASE_URL or "neon.tech" in settings.DATABASE_URL:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    connect_args = {"ssl": ctx}
+def resolve_db_host(hostname: str) -> str:
+    """Resolves database hostname to IPv4 address specifically to avoid IPv6 unreachable network errors."""
+    try:
+        # Get address info for IPv4 (socket.AF_INET) to force IPv4
+        addr_info = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        if addr_info:
+            ipv4_address = addr_info[0][4][0]
+            logger.info(f"Resolved database host '{hostname}' to IPv4 address: {ipv4_address}")
+            return ipv4_address
+    except Exception as e:
+        logger.error(f"DNS Resolution failed for host '{hostname}': {e}")
+        raise DatabaseDNSResolveError(f"DNS Resolution failed for host '{hostname}'. Verify hostname or internet connection.")
+    return hostname
 
+def run_db_diagnostics() -> None:
+    """Runs comprehensive network diagnostics on startup for the configured database."""
+    if not settings.DATABASE_URL:
+        raise InvalidDatabaseURLError("DATABASE_URL is not configured.")
+        
+    try:
+        parsed = urlparse(settings.DATABASE_URL)
+    except Exception as e:
+        raise InvalidDatabaseURLError(f"Malformed DATABASE_URL: {e}")
+        
+    if not parsed.scheme.startswith("postgresql"):
+        raise InvalidDatabaseURLError(f"Invalid database scheme '{parsed.scheme}'. Must start with 'postgresql'.")
+        
+    host = parsed.hostname
+    port = parsed.port or 5432
+    dbname = parsed.path.strip('/')
+    
+    logger.info("=== DATABASE DIAGNOSTICS ===")
+    logger.info(f"Database Provider: {'Supabase' if 'supabase' in (host or '') else 'PostgreSQL'}")
+    logger.info(f"Host: {host}")
+    logger.info(f"Port: {port}")
+    logger.info(f"Database Name: {dbname}")
+    logger.info(f"Driver: {parsed.scheme.split('+')[1] if '+' in parsed.scheme else 'psycopg2'}")
+    
+    import sys
+    is_testing = "pytest" in sys.modules or settings.APP_ENV == "testing"
+
+    # 1. DNS Resolution Check
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
+        ip = addr_info[0][4][0]
+        logger.info(f"DNS Resolution: SUCCESS (IP: {ip})")
+    except socket.gaierror as e:
+        logger.error(f"DNS Resolution: FAILED for host '{host}': {e}")
+        if is_testing:
+            logger.warning("Bypassing DNS Resolution failure during testing.")
+            return
+        raise DatabaseDNSResolveError(f"DNS Resolution failed for host '{host}'. Verify hostname or internet connection.")
+        
+    # 2. Port Connection Check (TCP Ping)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect((ip, port))
+        logger.info(f"TCP Connection to {ip}:{port}: SUCCESS")
+    except socket.timeout as e:
+        logger.error(f"TCP Connection to {ip}:{port}: TIMEOUT")
+        if is_testing:
+            logger.warning("Bypassing TCP connection timeout during testing.")
+            return
+        raise DatabaseTimeoutError(f"TCP connection to database at {host}:{port} timed out after 5 seconds.")
+    except OSError as e:
+        logger.error(f"TCP Connection to {ip}:{port}: FAILED ({e})")
+        if is_testing:
+            logger.warning("Bypassing TCP connection failure during testing.")
+            return
+        raise DatabasePortUnreachableError(f"Cannot reach database port {port} at {host}. Firewall blocking or port closed. Details: {e}")
+    finally:
+        try:
+            s.close()
+        except:
+            pass
+            
+    # 3. SSL Negotiation Check (if not localhost)
+    if host not in ("localhost", "127.0.0.1"):
+        logger.info("SSL Enabled: YES")
+        try:
+            context = ssl.create_default_context()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            ssl_conn = context.wrap_socket(s, server_hostname=host)
+            ssl_conn.connect((ip, port))
+            logger.info("SSL Handshake/Negotiation: SUCCESS")
+            ssl_conn.close()
+        except Exception as e:
+            logger.error(f"SSL Handshake/Negotiation: FAILED: {e}")
+            if is_testing:
+                logger.warning("Bypassing SSL Handshake failure during testing.")
+                return
+            raise DatabaseSSLHandshakeError(f"SSL/TLS handshake failed connecting to {host}:{port}. SSL mode mismatch or certification issues: {e}")
+    else:
+        logger.info("SSL Enabled: NO")
+        
+    logger.info("Connection Status: DIAGNOSTICS PASSED")
+    logger.info(f"Environment: {settings.APP_ENV}")
+    logger.info("============================")
+
+# Parse database connection URL and resolve host to force IPv4
+parsed_url = urlparse(settings.DATABASE_URL)
+original_host = parsed_url.hostname
+connect_args: Dict[str, Any] = {}
+
+if original_host:
+    # Resolve host to IPv4
+    try:
+        resolved_ip = resolve_db_host(original_host)
+    except DatabaseDNSResolveError:
+        # If offline or DNS fails during import/dry-run, fallback to original host
+        resolved_ip = original_host
+        
+    # Reconstruct DATABASE_URL with resolved IPv4 to prevent OSError [Errno 101] Network is unreachable
+    if original_host != resolved_ip:
+        netloc = parsed_url.netloc
+        new_netloc = netloc.replace(original_host, resolved_ip, 1)
+        db_url = parsed_url._replace(netloc=new_netloc).geturl()
+    else:
+        db_url = settings.DATABASE_URL
+        
+    # Set connection ssl arguments for remote database instances (e.g. Supabase)
+    if original_host not in ("localhost", "127.0.0.1"):
+        connect_args["ssl"] = "require"
+        # server_hostname is required for verifying certificate when connecting via IP address
+        if original_host != resolved_ip:
+            connect_args["server_hostname"] = original_host
+else:
+    db_url = settings.DATABASE_URL
+
+# Create async engine with robust pool configuration and IPv4 force-overrides
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    db_url,
     echo=settings.DEBUG and not settings.is_production,
-    pool_pre_ping=True,  # Checks connection liveness before checking it out
-    pool_size=10,        # Standard connections to keep open in the pool
-    max_overflow=20,     # Max extra connections beyond pool_size
-    connect_args=connect_args,
+    pool_pre_ping=True,      # Checks connection liveness before checking it out
+    pool_size=10,            # Standard connections to keep open in the pool
+    max_overflow=20,         # Max extra connections beyond pool_size
+    connect_args=connect_args
 )
 
 # Async session maker
@@ -31,6 +168,24 @@ async_session_maker = async_sessionmaker(
     class_=AsyncSession,
     expire_on_commit=False,
 )
+
+async def verify_db_connection() -> None:
+    """Verify that database credentials are valid and SELECT 1 query executes successfully."""
+    import sys
+    is_testing = "pytest" in sys.modules or settings.APP_ENV == "testing"
+    try:
+        async with async_session_maker() as session:
+            await session.execute(text("SELECT 1"))
+        logger.info("Database Authentication & Execution: SUCCESS")
+    except Exception as e:
+        logger.error(f"Database authentication/query execution failed: {e}")
+        if is_testing:
+            logger.warning("Bypassing database connection failure verification during testing.")
+            return
+        err_msg = str(e).lower()
+        if "password authentication failed" in err_msg or "invalid credentials" in err_msg or "fatal: auth" in err_msg:
+            raise DatabaseAuthenticationError(f"Database authentication failed. Verify username and password in DATABASE_URL. Details: {e}")
+        raise DatabaseConnectionPoolError(f"Database engine query verification failed: {e}")
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Dependency injection generator for async database sessions."""

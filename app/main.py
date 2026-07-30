@@ -17,6 +17,15 @@ setup_logging()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup hook: Initialize external clients
+    logger.info("Running database connectivity diagnostics...")
+    try:
+        from app.db.session import run_db_diagnostics, verify_db_connection
+        run_db_diagnostics()
+        await verify_db_connection()
+    except Exception as e:
+        logger.critical(f"Database configuration validation failed! Aborting startup. Error: {e}")
+        raise e
+
     logger.info("Initializing external service connection pools...")
     chroma_manager.connect()
     
@@ -24,6 +33,10 @@ async def lifespan(app: FastAPI):
     
     # Shutdown hook: Clean up pools
     logger.info("Shutting down external service connection pools...")
+    # Clean up engine connection pool
+    from app.db.session import engine
+    await engine.dispose()
+    logger.info("Database connection pool disposed.")
 
 app = FastAPI(
     title=settings.APP_NAME,

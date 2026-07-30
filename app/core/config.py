@@ -44,4 +44,15 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         return self.APP_ENV.lower() == "production"
 
+    @classmethod
+    def validate_critical_settings(cls, values: dict) -> dict:
+        db_url = values.get("DATABASE_URL")
+        if not db_url or db_url.strip() == "":
+            raise ValueError("DATABASE_URL environment variable is missing or empty. Application startup aborted.")
+        return values
+
 settings = Settings()
+# Custom manual check to trigger clear error message on init
+if not settings.DATABASE_URL or settings.DATABASE_URL.strip() == "":
+    raise ValueError("DATABASE_URL environment variable is missing or empty. Application startup aborted.")
+
