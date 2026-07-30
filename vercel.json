@@ -4,6 +4,14 @@
     {
       "source": "/api/v1/:path*",
       "destination": "https://ai-cold-call.onrender.com/api/v1/:path*"
+    },
+    {
+      "source": "/",
+      "destination": "/static/index.html"
+    },
+    {
+      "source": "/index.html",
+      "destination": "/static/index.html"
     }
   ]
 }
