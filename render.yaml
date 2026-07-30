@@ -1,0 +1,35 @@
+services:
+  # FastAPI Backend Web Service
+  - type: web
+    name: voice-agent-api
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: DATABASE_URL
+        sync: false # User will supply their own PostgreSQL connection string in the Render Dashboard
+      - key: VECTOR_DB_PROVIDER
+        value: chroma
+      - key: CHROMA_DB_PATH
+        value: ./data/chroma
+      - key: TELEPHONY_PROVIDER
+        value: plivo
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: groq
+      - key: FALLBACK_LLM_PROVIDER
+        value: openrouter
+    disk:
+      name: chroma-data
+      mountPath: /app/data/chroma
+      sizeGB: 10

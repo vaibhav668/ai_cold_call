@@ -1,0 +1,221 @@
+import uuid
+import json
+from typing import Tuple, List, Dict, Any, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.services.session_manager import SessionManager
+from app.services.llm_service import LLMService
+from app.services.prompt_service import PromptService
+from app.services.rag_service import RAGService
+from app.repositories.call_log import CallLogRepository
+from app.models.call_log import CallLog
+from app.core.logging import logger
+
+class ConversationEngine:
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+        self.session_manager = SessionManager()
+        self.llm_service = LLMService()
+        self.prompt_service = PromptService(db)
+        self.rag_service = RAGService()
+        self.call_log_repo = CallLogRepository(db)
+
+    def _get_tools_schema(self) -> List[Dict[str, Any]]:
+        """Define schemas for conversational tools available to LLaMA models."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "book_appointment",
+                    "description": "Schedule a customer appointment or reservation.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "date": {"type": "string", "description": "ISO date string (YYYY-MM-DD)"},
+                            "time": {"type": "string", "description": "Time string (HH:MM)"}
+                        },
+                        "required": ["date", "time"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "transfer_to_human",
+                    "description": "Transfer the call to a human operator or support representative.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_knowledge",
+                    "description": "Query the campaign knowledge database for specific business details or answers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Specific query term"}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ]
+
+    async def process_turn(
+        self,
+        call_id: str,
+        campaign_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        user_text: str
+    ) -> Tuple[str, bool, bool]:
+        """Runs the turn execution loop, resolving tool calls and outputting bot response flags."""
+        history = await self.session_manager.get_message_history(call_id)
+        state = await self.session_manager.get_session_state(call_id) or "greeting"
+        
+        # 1. Initialize session if empty
+        if not history:
+            # Dynamically pull prompt template and run initial RAG lookup on user text
+            compiled_prompt, _ = await self.prompt_service.build_prompt(
+                campaign_id=campaign_id,
+                customer_id=customer_id,
+                rag_query=user_text
+            )
+            history.append({"role": "system", "content": compiled_prompt})
+            await self.session_manager.append_message(call_id, history[-1])
+            
+        # 2. Append user input
+        user_turn = {"role": "user", "content": user_text}
+        history.append(user_turn)
+        await self.session_manager.append_message(call_id, user_turn)
+        
+        tools = self._get_tools_schema()
+        should_hangup = False
+        should_transfer = False
+        
+        # Loop to process tool calls (max 3 loops to avoid recursion)
+        loop_limit = 3
+        while loop_limit > 0:
+            content, tool_calls = await self.llm_service.generate_completion(history, tools)
+            
+            if not tool_calls:
+                # No more tools, LLM returned raw text
+                if content:
+                    bot_turn = {"role": "assistant", "content": content}
+                    history.append(bot_turn)
+                    await self.session_manager.append_message(call_id, bot_turn)
+                else:
+                    content = "I'm sorry, I didn't get that. Could you repeat?"
+                    
+                break
+                
+            # Process tool calls
+            tool_calls_message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls
+            }
+            history.append(tool_calls_message)
+            await self.session_manager.append_message(call_id, tool_calls_message)
+            
+            for tool_call in tool_calls:
+                tool_id = tool_call.get("id")
+                func_data = tool_call.get("function", {})
+                func_name = func_data.get("name")
+                args = {}
+                try:
+                    args = json.loads(func_data.get("arguments", "{}"))
+                except Exception:
+                    pass
+                    
+                tool_result_content = ""
+                
+                if func_name == "book_appointment":
+                    state = "appointment_booked"
+                    await self.session_manager.update_session_state(call_id, state)
+                    tool_result_content = f"Appointment successfully scheduled for {args.get('date')} at {args.get('time')}."
+                    
+                elif func_name == "transfer_to_human":
+                    state = "escalated"
+                    await self.session_manager.update_session_state(call_id, state)
+                    should_transfer = True
+                    tool_result_content = "Call transfer successfully initiated."
+                    
+                elif func_name == "lookup_knowledge":
+                    query = args.get("query", "")
+                    facts = await self.rag_service.search_knowledge(campaign_id, query, limit=2)
+                    facts_list = [f["text"] for f in facts]
+                    tool_result_content = json.dumps({"facts": facts_list})
+                    
+                else:
+                    tool_result_content = f"Error: Tool '{func_name}' not implemented."
+                    
+                tool_response = {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": func_name,
+                    "content": tool_result_content
+                }
+                history.append(tool_response)
+                await self.session_manager.append_message(call_id, tool_response)
+                
+            loop_limit -= 1
+            
+        # Detect state flags
+        low_content = (content or "").lower()
+        if "goodbye" in low_content or "bye" in low_content or state == "completed":
+            should_hangup = True
+            
+        if state == "escalated":
+            should_transfer = True
+            
+        return content or "", should_hangup, should_transfer
+
+    async def end_call(
+        self,
+        call_id: str,
+        campaign_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        phone_number: str,
+        duration_seconds: int
+    ) -> CallLog:
+        """Purge active Redis memory keys and flush completed conversation transcripts to PostgreSQL."""
+        history = await self.session_manager.get_message_history(call_id)
+        state = await self.session_manager.get_session_state(call_id) or "completed"
+        
+        # Convert message list format to DB-friendly JSON list
+        exchanges = []
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in ["user", "assistant"] and content:
+                exchanges.append({
+                    "sender": "customer" if role == "user" else "agent",
+                    "text": content
+                })
+                
+        # Status calculation
+        status_val = "completed"
+        if state == "escalated":
+            status_val = "completed"  # Escalated is treated as completed handoff
+        elif not exchanges:
+            status_val = "failed"
+            
+        call_log = CallLog(
+            campaign_id=campaign_id,
+            customer_id=customer_id,
+            plivo_call_uuid=call_id,
+            phone_number=phone_number,
+            status=status_val,
+            duration_seconds=duration_seconds,
+            transcript=exchanges
+        )
+        
+        created_log = await self.call_log_repo.create(call_log)
+        await self.db.commit()
+        
+        # Purge Redis keys
+        await self.session_manager.clear_session(call_id)
+        return created_log

@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: voice_agent_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: voice_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d voice_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_agent_fastapi
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/voice_agent
+      - VECTOR_DB_PROVIDER=chroma
+      - CHROMA_DB_PATH=./data/chroma
+      - TELEPHONY_PROVIDER=plivo
+      - JWT_SECRET_KEY=supersecretdevelopmentkeychangeinproduction
+      - OPENAI_API_KEY=test_openai_key
+      - GROQ_API_KEY=test_groq_key
+      - OPENROUTER_API_KEY=test_openrouter_key
+      - LLM_PROVIDER=groq
+      - FALLBACK_LLM_PROVIDER=openrouter
+      - LLM_MODEL=llama-3.1-8b-instant
+    volumes:
+      - chroma_data:/app/data/chroma
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  chroma_data:
