@@ -6,14 +6,23 @@ from sqlalchemy.ext.asyncio import (
 )
 from app.core.config import settings
 from app.core.logging import logger
+import ssl
 
-# Create async engine with robust pool configuration
+# Create async engine with robust pool configuration and programmatic SSL logic
+connect_args = {}
+if "supabase.co" in settings.DATABASE_URL or "neon.tech" in settings.DATABASE_URL:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    connect_args = {"ssl": ctx}
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG and not settings.is_production,
     pool_pre_ping=True,  # Checks connection liveness before checking it out
     pool_size=10,        # Standard connections to keep open in the pool
     max_overflow=20,     # Max extra connections beyond pool_size
+    connect_args=connect_args,
 )
 
 # Async session maker

@@ -40,7 +40,12 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
     url = get_sync_db_url()
-    connectable = create_engine(url)
+    
+    connect_args = {}
+    if "supabase.co" in url or "neon.tech" in url:
+        connect_args = {"sslmode": "require"}
+        
+    connectable = create_engine(url, connect_args=connect_args)
 
     with connectable.connect() as connection:
         context.configure(
