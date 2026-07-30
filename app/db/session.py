@@ -34,8 +34,25 @@ def resolve_db_host(hostname: str) -> str:
             logger.info(f"Resolved database host '{hostname}' to IPv4 address: {ipv4_address}")
             return ipv4_address
     except Exception as e:
-        logger.error(f"DNS Resolution failed for host '{hostname}': {e}")
-        raise DatabaseDNSResolveError(f"DNS Resolution failed for host '{hostname}'. Verify hostname or internet connection.")
+        logger.warning(
+            f"IPv4 DNS Resolution failed for host '{hostname}': {e}. "
+            "If this is an IPv6-only host (like db.[ref].supabase.co), please note that Render "
+            "does not support IPv6 outbound routing. You must use the Supabase Connection Pooler "
+            "host (ending in pooler.supabase.com) on port 6543 or 5432, which supports IPv4."
+        )
+        # Fallback to dynamic resolution via AF_UNSPEC
+        try:
+            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+            if addr_info:
+                ip = addr_info[0][4][0]
+                logger.info(f"Fallback Resolved database host '{hostname}' to IP: {ip}")
+                return ip
+        except Exception as fallback_err:
+            logger.error(f"Fallback DNS Resolution failed for host '{hostname}': {fallback_err}")
+            raise DatabaseDNSResolveError(
+                f"DNS Resolution failed for host '{hostname}'. "
+                "Verify hostname or connection. If using Supabase, switch to the pooler.supabase.com host."
+            )
     return hostname
 
 def get_engine():
