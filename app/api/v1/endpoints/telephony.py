@@ -52,12 +52,30 @@ async def trigger_outbound_call(
 async def plivo_answer_webhook(
     request: Request,
     campaign_id: uuid.UUID,
-    customer_id: uuid.UUID
+    customer_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db_session)
 ):
     """Plivo answer callback webhook returning XML Stream instructions."""
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID", f"unknown-call-{uuid.uuid4()}")
     host = request.headers.get("host", "example.com")
+    
+    # Dynamically link the CallUUID to the CallLog so the websocket and status callbacks can match it
+    try:
+        query = select(CallLog).where(
+            CallLog.campaign_id == campaign_id,
+            CallLog.customer_id == customer_id,
+            CallLog.status.in_(["initiated", "ringing"])
+        ).order_by(CallLog.created_at.desc())
+        result = await db.execute(query)
+        call_log = result.scalars().first()
+        if call_log:
+            call_log.plivo_call_uuid = call_uuid
+            call_log.status = "ringing"
+            await db.commit()
+            logger.info(f"Answer Webhook: Linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
+    except Exception as e:
+        logger.error(f"Error linking call_uuid in answer webhook: {e}")
     
     xml_content = f"""<Response>
     <Stream url="wss://{host}/api/v1/telephony/stream/{call_uuid}"/>
@@ -85,12 +103,13 @@ async def plivo_status_webhook(
     """Processes Plivo call lifecycle status callbacks (completed, failed, ringing)."""
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID")
+    request_uuid = form_data.get("RequestUUID")
     call_status = form_data.get("CallStatus")
     duration = int(form_data.get("Duration", 0))
     
     if call_uuid and call_status:
         service = TelephonyService(db)
-        await service.process_status_update(call_uuid, call_status, duration)
+        await service.process_status_update(call_uuid, call_status, duration, request_uuid)
         
     return Response(content="<Response></Response>", media_type="application/xml")
 

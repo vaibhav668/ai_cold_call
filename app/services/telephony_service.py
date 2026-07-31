@@ -90,9 +90,23 @@ class TelephonyService:
             await self.db.commit()
             return "", "failed"
 
-    async def process_status_update(self, plivo_uuid: str, call_status: str, duration: int = 0) -> None:
+    async def process_status_update(
+        self,
+        plivo_uuid: str,
+        call_status: str,
+        duration: int = 0,
+        request_uuid: str = None
+    ) -> None:
         """Update Postgres CallLog and CampaignLead status records matching the Plivo call UUID."""
-        query = select(self.call_log_repo.model).where(self.call_log_repo.model.plivo_call_uuid == plivo_uuid)
+        # Match by CallUUID (plivo_uuid) or RequestUUID (request_uuid)
+        if request_uuid:
+            query = select(self.call_log_repo.model).where(
+                (self.call_log_repo.model.plivo_call_uuid == plivo_uuid) |
+                (self.call_log_repo.model.plivo_call_uuid == request_uuid)
+            )
+        else:
+            query = select(self.call_log_repo.model).where(self.call_log_repo.model.plivo_call_uuid == plivo_uuid)
+            
         result = await self.db.execute(query)
         call_log = result.scalars().first()
         
