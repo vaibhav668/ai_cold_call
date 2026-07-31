@@ -123,11 +123,14 @@ class ConversationEngine:
         # - If it returns text content, break immediately.
         # - If the loop exhausts (LLM kept calling tools for 3 rounds with no text),
         #   make ONE final forced completion call WITHOUT tools to guarantee text output.
+        should_hangup = False
+        should_transfer = False
         loop_limit = 3
         content: Optional[str] = None
         made_tool_calls = False
         # Greeting must never call tools — forces plain spoken text immediately
         active_tools = None if is_greeting else self._get_tools_schema()
+
 
         while loop_limit > 0:
             content, tool_calls = await self.llm_service.generate_completion(history, active_tools)
