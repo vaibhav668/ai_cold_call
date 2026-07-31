@@ -137,7 +137,66 @@ async def plivo_audio_stream_websocket(
             
             if event == "start":
                 start_data = data.get("start", {})
-                logger.info(f"Stream started for Call UUID {call_uuid}. Stream ID: {start_data.get('streamSid')}")
+                logger.info(f"Stream started for Call UUID {call_uuid}. Stream ID: {start_data.get('streamId') or start_data.get('streamSid')}")
+                
+                # Trigger the initial greeting outbound flow immediately
+                logger.info(f"Triggering initial greeting for Call UUID {call_uuid}...")
+                campaign_id = None
+                customer_id = None
+                
+                async for db in get_db_session():
+                    query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
+                    result = await db.execute(query)
+                    call_log = result.scalars().first()
+                    if call_log:
+                        campaign_id = call_log.campaign_id
+                        customer_id = call_log.customer_id
+                    break
+                    
+                if not campaign_id or not customer_id:
+                    async for db in get_db_session():
+                        query = select(CallLog).where(
+                            CallLog.status.in_(["initiated", "ringing"])
+                        ).order_by(CallLog.created_at.desc())
+                        result = await db.execute(query)
+                        call_log = result.scalars().first()
+                        if call_log:
+                            campaign_id = call_log.campaign_id
+                            customer_id = call_log.customer_id
+                            # Link the call_uuid right now to prevent future race conditions
+                            call_log.plivo_call_uuid = call_uuid
+                            await db.commit()
+                            logger.info(f"WebSocket Start: Fallback linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
+                        break
+                        
+                if campaign_id and customer_id:
+                    response_text = ""
+                    async for db in get_db_session():
+                        engine = ConversationEngine(db)
+                        response_text, should_hangup, should_transfer = await engine.process_turn(
+                            call_id=call_uuid,
+                            campaign_id=campaign_id,
+                            customer_id=customer_id,
+                            user_text="Hello"
+                        )
+                        break
+                        
+                    if response_text:
+                        bot_is_speaking = True
+                        async for audio_chunk in tts.stream_speech(response_text):
+                            if not bot_is_speaking:
+                                break
+                            payload_out = base64.b64encode(audio_chunk).decode("utf-8")
+                            reply_msg = {
+                                "event": "playAudio",
+                                "media": {
+                                    "contentType": "audio/x-mulaw",
+                                    "sampleRate": 8000,
+                                    "payload": payload_out
+                                }
+                            }
+                            await websocket.send_text(json.dumps(reply_msg))
+                        bot_is_speaking = False
                 
             elif event == "media":
                 media_data = data.get("media", {})
@@ -151,8 +210,8 @@ async def plivo_audio_stream_websocket(
                     if is_user_speaking and bot_is_speaking:
                         logger.info(f"User speech detected. Interrupting bot speech for Call {call_uuid}.")
                         bot_is_speaking = False
-                        # Send clear command to Plivo to flush voice buffers
-                        await websocket.send_text(json.dumps({"event": "clear"}))
+                        # Send clearAudio command to Plivo to flush voice buffers
+                        await websocket.send_text(json.dumps({"event": "clearAudio"}))
                         
                     # 2. Feed to Streaming STT
                     transcript = await stt.transcribe_chunk(raw_audio)
@@ -172,6 +231,21 @@ async def plivo_audio_stream_websocket(
                                 customer_id = call_log.customer_id
                             break
                             
+                        if not campaign_id or not customer_id:
+                            async for db in get_db_session():
+                                query = select(CallLog).where(
+                                    CallLog.status.in_(["initiated", "ringing"])
+                                ).order_by(CallLog.created_at.desc())
+                                result = await db.execute(query)
+                                call_log = result.scalars().first()
+                                if call_log:
+                                    campaign_id = call_log.campaign_id
+                                    customer_id = call_log.customer_id
+                                    call_log.plivo_call_uuid = call_uuid
+                                    await db.commit()
+                                    logger.info(f"WebSocket Media: Fallback linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
+                                break
+                                
                         if not campaign_id or not customer_id:
                             campaign_id = uuid.uuid4()
                             customer_id = uuid.uuid4()
@@ -197,8 +271,10 @@ async def plivo_audio_stream_websocket(
                                     
                                 payload_out = base64.b64encode(audio_chunk).decode("utf-8")
                                 reply_msg = {
-                                    "event": "media",
+                                    "event": "playAudio",
                                     "media": {
+                                        "contentType": "audio/x-mulaw",
+                                        "sampleRate": 8000,
                                         "payload": payload_out
                                     }
                                 }

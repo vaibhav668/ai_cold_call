@@ -19,6 +19,7 @@ class FasterWhisperProvider(SpeechToTextProvider):
     def __init__(self) -> None:
         self.model = None
         self.accumulated_audio: List[float] = []
+        self.mock_provider = MockSTTProvider()
 
     def _init_model(self) -> None:
         if not self.model:
@@ -33,8 +34,7 @@ class FasterWhisperProvider(SpeechToTextProvider):
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[str]:
         self._init_model()
         if not self.model:
-            mock = MockSTTProvider()
-            return await mock.transcribe_chunk(audio_chunk)
+            return await self.mock_provider.transcribe_chunk(audio_chunk)
 
         # Append float32 samples
         pcm_samples = ulaw_to_pcm_array(audio_chunk)
