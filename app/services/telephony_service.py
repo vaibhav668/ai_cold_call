@@ -76,7 +76,7 @@ class TelephonyService:
                     return "", "failed"
                     
                 data = response.json()
-                request_uuid = data.get("request_uuid", "")
+                request_uuid = data.get("request_uuid", "") or data.get("api_id", "") or f"pending-{uuid.uuid4()}"
                 
                 await self.call_log_repo.update(call_log, {
                     "plivo_call_uuid": request_uuid,
