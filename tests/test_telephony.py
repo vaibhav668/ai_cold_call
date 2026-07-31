@@ -165,7 +165,7 @@ def test_websocket_audio_stream(monkeypatch):
         # Expect simulated bot media response
         reply = ws.receive_text()
         data = json.loads(reply)
-        assert data["event"] == "media"
+        assert data["event"] == "playAudio"
         assert "payload" in data["media"]
         
         # Send stop event

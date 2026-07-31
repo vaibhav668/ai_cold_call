@@ -55,6 +55,8 @@ async def create_campaign(
     await workflow_service.seed_campaign_defaults(db_obj.id, db_obj.workflow_type)
     await db.commit()
     
+    if hasattr(db, "refresh"):
+        await db.refresh(db_obj)
     return db_obj
 
 @router.get("/{campaign_id}", response_model=CampaignOut)
@@ -92,6 +94,8 @@ async def update_campaign(
     update_data = campaign_in.model_dump(exclude_unset=True)
     updated_obj = await campaign_repo.update(campaign, update_data)
     await db.commit()
+    if hasattr(db, "refresh"):
+        await db.refresh(updated_obj)
     return updated_obj
 
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
