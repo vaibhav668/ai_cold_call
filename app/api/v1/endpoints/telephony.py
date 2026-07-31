@@ -113,6 +113,42 @@ async def plivo_status_webhook(
         
     return Response(content="<Response></Response>", media_type="application/xml")
 
+async def _resolve_call_context(call_uuid: str) -> tuple[Optional[uuid.UUID], Optional[uuid.UUID]]:
+    """Resolves campaign_id and customer_id with multi-tier database fallback."""
+    async for db in get_db_session():
+        # Tier 1: Exact match on plivo_call_uuid
+        query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
+        result = await db.execute(query)
+        call_log = result.scalars().first()
+        if call_log:
+            return call_log.campaign_id, call_log.customer_id
+            
+        # Tier 2: Recent initiated or ringing call log
+        query = select(CallLog).where(
+            CallLog.status.in_(["initiated", "ringing"])
+        ).order_by(CallLog.created_at.desc())
+        result = await db.execute(query)
+        call_log = result.scalars().first()
+        if call_log:
+            call_log.plivo_call_uuid = call_uuid
+            await db.commit()
+            logger.info(f"WebSocket: Linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
+            return call_log.campaign_id, call_log.customer_id
+
+        # Tier 3: Fallback to latest CallLog
+        query = select(CallLog).order_by(CallLog.created_at.desc())
+        result = await db.execute(query)
+        call_log = result.scalars().first()
+        if call_log:
+            call_log.plivo_call_uuid = call_uuid
+            await db.commit()
+            logger.info(f"WebSocket: Fallback linked latest CallLog ID {call_log.id} to CallUUID {call_uuid}")
+            return call_log.campaign_id, call_log.customer_id
+            
+        break
+        
+    return None, None
+
 @router.websocket("/telephony/stream/{call_uuid}")
 async def plivo_audio_stream_websocket(
     websocket: WebSocket,
@@ -122,8 +158,8 @@ async def plivo_audio_stream_websocket(
     await websocket.accept()
     logger.info(f"Plivo Audio Stream WebSocket connection accepted: {call_uuid}")
     
-    # Initialize pipeline checkers
-    vad = VADService(threshold=1500.0)
+    # Initialize pipeline checkers (VAD threshold set higher to prevent line noise false interruptions)
+    vad = VADService(threshold=4500.0)
     stt = SpeechService()
     tts = VoiceService()
     
@@ -141,39 +177,14 @@ async def plivo_audio_stream_websocket(
                 
                 # Trigger the initial greeting outbound flow immediately
                 logger.info(f"Triggering initial greeting for Call UUID {call_uuid}...")
-                campaign_id = None
-                customer_id = None
-                
-                async for db in get_db_session():
-                    query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
-                    result = await db.execute(query)
-                    call_log = result.scalars().first()
-                    if call_log:
-                        campaign_id = call_log.campaign_id
-                        customer_id = call_log.customer_id
-                    break
-                    
-                if not campaign_id or not customer_id:
-                    async for db in get_db_session():
-                        query = select(CallLog).where(
-                            CallLog.status.in_(["initiated", "ringing"])
-                        ).order_by(CallLog.created_at.desc())
-                        result = await db.execute(query)
-                        call_log = result.scalars().first()
-                        if call_log:
-                            campaign_id = call_log.campaign_id
-                            customer_id = call_log.customer_id
-                            # Link the call_uuid right now to prevent future race conditions
-                            call_log.plivo_call_uuid = call_uuid
-                            await db.commit()
-                            logger.info(f"WebSocket Start: Fallback linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
-                        break
+                campaign_id, customer_id = await _resolve_call_context(call_uuid)
                         
                 if campaign_id and customer_id:
                     response_text = ""
+                    should_hangup = False
                     async for db in get_db_session():
                         engine = ConversationEngine(db)
-                        response_text, should_hangup, should_transfer = await engine.process_turn(
+                        response_text, should_hangup, _ = await engine.process_turn(
                             call_id=call_uuid,
                             campaign_id=campaign_id,
                             customer_id=customer_id,
@@ -197,6 +208,11 @@ async def plivo_audio_stream_websocket(
                             }
                             await websocket.send_text(json.dumps(reply_msg))
                         bot_is_speaking = False
+                        
+                        if should_hangup:
+                            logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
+                            await websocket.close()
+                            break
                 
             elif event == "media":
                 media_data = data.get("media", {})
@@ -219,41 +235,17 @@ async def plivo_audio_stream_websocket(
                         logger.info(f"STT Transcript captured: '{transcript}'")
                         
                         # 3. Retrieve context and run Conversation Turn
-                        campaign_id = None
-                        customer_id = None
-                        
-                        async for db in get_db_session():
-                            query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
-                            result = await db.execute(query)
-                            call_log = result.scalars().first()
-                            if call_log:
-                                campaign_id = call_log.campaign_id
-                                customer_id = call_log.customer_id
-                            break
-                            
-                        if not campaign_id or not customer_id:
-                            async for db in get_db_session():
-                                query = select(CallLog).where(
-                                    CallLog.status.in_(["initiated", "ringing"])
-                                ).order_by(CallLog.created_at.desc())
-                                result = await db.execute(query)
-                                call_log = result.scalars().first()
-                                if call_log:
-                                    campaign_id = call_log.campaign_id
-                                    customer_id = call_log.customer_id
-                                    call_log.plivo_call_uuid = call_uuid
-                                    await db.commit()
-                                    logger.info(f"WebSocket Media: Fallback linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
-                                break
+                        campaign_id, customer_id = await _resolve_call_context(call_uuid)
                                 
                         if not campaign_id or not customer_id:
                             campaign_id = uuid.uuid4()
                             customer_id = uuid.uuid4()
                             
                         response_text = ""
+                        should_hangup = False
                         async for db in get_db_session():
                             engine = ConversationEngine(db)
-                            response_text, should_hangup, should_transfer = await engine.process_turn(
+                            response_text, should_hangup, _ = await engine.process_turn(
                                 call_id=call_uuid,
                                 campaign_id=campaign_id,
                                 customer_id=customer_id,
@@ -281,6 +273,11 @@ async def plivo_audio_stream_websocket(
                                 await websocket.send_text(json.dumps(reply_msg))
                                 
                             bot_is_speaking = False
+                            
+                            if should_hangup:
+                                logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
+                                await websocket.close()
+                                break
                             
                 except Exception as e:
                     logger.warning(f"Error handling media frame: {e}")

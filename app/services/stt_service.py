@@ -60,7 +60,8 @@ class MockSTTProvider(SpeechToTextProvider):
 
     async def transcribe_chunk(self, audio_chunk: bytes) -> Optional[str]:
         self.chunks_received += 1
-        if self.chunks_received >= 10:
+        # Require ~150 chunks (approx 3 seconds of audio at 50fps) before returning a transcript
+        if self.chunks_received >= 150:
             self.chunks_received = 0
             return "hello i would like to reschedule my appointment"
         return None

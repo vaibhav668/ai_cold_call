@@ -67,9 +67,10 @@ class CoquiXTTSProvider(TextToSpeechProvider):
 
 class MockTTSProvider(TextToSpeechProvider):
     async def stream_speech(self, text: str) -> AsyncGenerator[bytes, None]:
-        # Yield simulated PCMU audio silence blocks
-        for _ in range(5):
-            yield b"\xFF" * 160
+        # Generate 50 frames (~1 second) of audible 440Hz tone in G.711 mu-law PCMU
+        tone_chunk = bytes([0x1E, 0x0B, 0x02, 0x02, 0x0B, 0x1E, 0x9E, 0x8B, 0x82, 0x82, 0x8B, 0x9E] * 13 + [0x1E, 0x0B, 0x02, 0x02])
+        for _ in range(50):
+            yield tone_chunk
 
 class VoiceService:
     def __init__(self) -> None:
