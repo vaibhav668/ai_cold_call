@@ -89,6 +89,10 @@ def get_engine():
             # Set connection ssl arguments for remote database instances
             if original_host not in ("localhost", "127.0.0.1"):
                 connect_args["ssl"] = "require"
+                # Disable prepared statements cache for Supabase Connection Pooler / PgBouncer in transaction mode
+                if "pooler" in original_host or parsed_url.port == 6543:
+                    connect_args["statement_cache_size"] = 0
+                    connect_args["prepared_statement_cache_size"] = 0
         else:
             db_url = settings.DATABASE_URL
 
