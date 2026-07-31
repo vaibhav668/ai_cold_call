@@ -411,7 +411,7 @@ async def plivo_audio_stream_websocket(
         pipeline_task = asyncio.create_task(
             _run_pipeline(
                 call_uuid=call_uuid,
-                user_text="Hello",
+                user_text="[CALL_START]",
                 campaign_id=campaign_id,
                 customer_id=customer_id,
                 audio_queue=audio_queue,
