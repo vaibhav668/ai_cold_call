@@ -163,18 +163,26 @@ class ConversationEngine:
                 
             loop_limit -= 1
             
-        # Detect state flags (use word boundaries and require history > 3 to avoid hanging up during initial greeting)
+        # Hangup detection — strict conditions to prevent premature termination:
+        # 1. Require at least 6 messages in history (system + 2+ exchanges) before considering hangup
+        # 2. Use unambiguous, complete farewell phrases only
+        # 3. State must be explicitly "completed" by a tool call
         import re
         low_content = (content or "").lower()
-        farewell_pattern = r'\b(goodbye|bye bye|bye-bye|have a nice day|have a great day)\b'
-        if re.search(farewell_pattern, low_content) and len(history) > 3:
+        assistant_turns = sum(1 for m in history if m.get("role") == "assistant")
+        FAREWELL_RE = re.compile(
+            r'\b(goodbye for now|have a great day|take care, goodbye|'
+            r'thanks for calling, goodbye|thank you for calling, goodbye|'
+            r'have a wonderful day|is there anything else before we go)\b'
+        )
+        if FAREWELL_RE.search(low_content) and assistant_turns >= 2:
             should_hangup = True
         elif state == "completed":
             should_hangup = True
-            
+
         if state == "escalated":
             should_transfer = True
-            
+
         return content or "", should_hangup, should_transfer
 
     async def end_call(

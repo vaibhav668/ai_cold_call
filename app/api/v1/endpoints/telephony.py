@@ -1,23 +1,64 @@
+"""
+Telephony API Endpoints
+=======================
+Handles:
+  - POST /telephony/dial         — trigger outbound call via Plivo REST
+  - POST /telephony/answer       — Plivo answer webhook → return XML stream instructions
+  - POST /telephony/inbound      — inbound call webhook
+  - POST /telephony/status       — Plivo call lifecycle status callbacks
+  - WS   /telephony/stream/{id}  — bidirectional Plivo media stream WebSocket
+
+WebSocket Architecture
+----------------------
+The WebSocket handler uses TWO concurrent asyncio Tasks:
+
+  _recv_loop(...)   Reads every incoming Plivo JSON frame.
+                    Routes audio bytes through VAD → utterance buffer.
+                    On speech_start → signals barge-in if AI is speaking.
+                    On speech_end   → hands utterance buffer to STT pipeline.
+
+  _pipeline(...)    STT → LLM → TTS.
+                    Protected by an asyncio.Lock to prevent parallel requests.
+                    Each TTS frame is pushed into an asyncio.Queue.
+
+  _send_loop(...)   Drains the asyncio.Queue and sends playAudio frames to Plivo.
+                    Checks a cancel_event per-utterance to abort mid-stream.
+
+This ensures incoming audio is ALWAYS being read regardless of what TTS is doing,
+which is the fix for the fundamental "bot cannot hear while speaking" bug.
+"""
+
 from fastapi import APIRouter, Depends, status, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 import json
 import base64
+import asyncio
 from typing import Optional
+
 from app.db.session import get_db_session
 from app.api.deps import get_current_user, RoleChecker
 from app.schemas.telephony import CallTriggerIn, CallTriggerOut
 from app.services.telephony_service import TelephonyService
-from app.services.vad_service import VADService
+from app.services.vad_service import EndOfSpeechDetector
 from app.services.stt_service import SpeechService
 from app.services.tts_service import VoiceService
 from app.services.conversation_engine import ConversationEngine
+from app.services.call_state_machine import CallStateMachine, CallState
 from app.models.call_log import CallLog
 from app.core.logging import logger
 from app.models.user import User
 
 router = APIRouter()
+
+# Sentinel value pushed into the audio queue to signal "stop current playback"
+_STOP_SENTINEL = b"__STOP__"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REST endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/telephony/dial", response_model=CallTriggerOut)
 async def trigger_outbound_call(
@@ -28,7 +69,7 @@ async def trigger_outbound_call(
 ):
     """Initiates an outbound cold call using Plivo's REST API."""
     host = request.headers.get("host", "example.com")
-    
+
     service = TelephonyService(db)
     request_uuid, call_status = await service.initiate_call(
         campaign_id=payload.campaign_id,
@@ -36,17 +77,15 @@ async def trigger_outbound_call(
         phone_number=payload.phone_number,
         callback_domain=host
     )
-    
+
     if not request_uuid:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Outbound call dialer trigger failed."
         )
-        
-    return {
-        "request_uuid": request_uuid,
-        "status": call_status
-    }
+
+    return {"request_uuid": request_uuid, "status": call_status}
+
 
 @router.post("/telephony/answer")
 async def plivo_answer_webhook(
@@ -59,8 +98,7 @@ async def plivo_answer_webhook(
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID", f"unknown-call-{uuid.uuid4()}")
     host = request.headers.get("host", "example.com")
-    
-    # Dynamically link the CallUUID to the CallLog so the websocket and status callbacks can match it
+
     try:
         query = select(CallLog).where(
             CallLog.campaign_id == campaign_id,
@@ -76,54 +114,61 @@ async def plivo_answer_webhook(
             logger.info(f"Answer Webhook: Linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
     except Exception as e:
         logger.error(f"Error linking call_uuid in answer webhook: {e}")
-    
+
     xml_content = f"""<Response>
     <Stream bidirectional="true" keepCallAlive="true">wss://{host}/api/v1/telephony/stream/{call_uuid}</Stream>
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
 
+
 @router.post("/telephony/inbound")
 async def plivo_inbound_webhook(request: Request):
-    """Handles incoming customer support calls, returning custom Speak & Stream instructions."""
+    """Handles incoming customer support calls."""
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID", f"inbound-call-{uuid.uuid4()}")
     host = request.headers.get("host", "example.com")
-    
+
     xml_content = f"""<Response>
-    <Speak>Thank you for calling Mercy Hospital. Please hold while we connect you to our voice coordinator.</Speak>
+    <Speak>Thank you for calling. Please hold while we connect you to our voice assistant.</Speak>
     <Stream bidirectional="true" keepCallAlive="true">wss://{host}/api/v1/telephony/stream/{call_uuid}</Stream>
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
+
 
 @router.post("/telephony/status")
 async def plivo_status_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db_session)
 ):
-    """Processes Plivo call lifecycle status callbacks (completed, failed, ringing)."""
+    """Processes Plivo call lifecycle status callbacks."""
     form_data = await request.form()
     call_uuid = form_data.get("CallUUID")
     request_uuid = form_data.get("RequestUUID")
     call_status = form_data.get("CallStatus")
     duration = int(form_data.get("Duration", 0))
-    
+
     if call_uuid and call_status:
         service = TelephonyService(db)
         await service.process_status_update(call_uuid, call_status, duration, request_uuid)
-        
+
     return Response(content="<Response></Response>", media_type="application/xml")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context resolution helper
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _resolve_call_context(call_uuid: str) -> tuple[Optional[uuid.UUID], Optional[uuid.UUID]]:
     """Resolves campaign_id and customer_id with multi-tier database fallback."""
     async for db in get_db_session():
-        # Tier 1: Exact match on plivo_call_uuid
+        # Tier 1: Exact match
         query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
         result = await db.execute(query)
         call_log = result.scalars().first()
         if call_log:
             return call_log.campaign_id, call_log.customer_id
-            
-        # Tier 2: Recent initiated or ringing call log
+
+        # Tier 2: Recent initiated/ringing — link UUID and return
         query = select(CallLog).where(
             CallLog.status.in_(["initiated", "ringing"])
         ).order_by(CallLog.created_at.desc())
@@ -135,7 +180,7 @@ async def _resolve_call_context(call_uuid: str) -> tuple[Optional[uuid.UUID], Op
             logger.info(f"WebSocket: Linked CallLog ID {call_log.id} to CallUUID {call_uuid}")
             return call_log.campaign_id, call_log.customer_id
 
-        # Tier 3: Fallback to latest CallLog
+        # Tier 3: Absolute fallback
         query = select(CallLog).order_by(CallLog.created_at.desc())
         result = await db.execute(query)
         call_log = result.scalars().first()
@@ -144,164 +189,379 @@ async def _resolve_call_context(call_uuid: str) -> tuple[Optional[uuid.UUID], Op
             await db.commit()
             logger.info(f"WebSocket: Fallback linked latest CallLog ID {call_log.id} to CallUUID {call_uuid}")
             return call_log.campaign_id, call_log.customer_id
-            
+
         break
-        
+
     return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket inner tasks
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _send_loop(
+    websocket: WebSocket,
+    audio_queue: asyncio.Queue,
+    call_uuid: str,
+    sm: CallStateMachine,
+) -> None:
+    """
+    Drains audio_queue and sends playAudio frames to Plivo.
+    A _STOP_SENTINEL in the queue clears the remaining buffer and
+    sends a clearAudio command to Plivo to flush its jitter buffer.
+    """
+    try:
+        while not sm.is_terminal():
+            item = await asyncio.wait_for(audio_queue.get(), timeout=30.0)
+
+            if item is _STOP_SENTINEL:
+                # Discard everything else currently queued (mid-stream frames)
+                drained = 0
+                while not audio_queue.empty():
+                    audio_queue.get_nowait()
+                    drained += 1
+                if drained:
+                    logger.debug(f"[SEND] Drained {drained} queued frames on barge-in.")
+
+                # Tell Plivo to clear its audio buffer too
+                try:
+                    await websocket.send_text(json.dumps({"event": "clearAudio"}))
+                    logger.info(f"[SEND] clearAudio sent to Plivo for {call_uuid}")
+                except Exception:
+                    pass
+                continue
+
+            if item is None:
+                # None = shutdown signal from pipeline
+                break
+
+            payload_b64 = base64.b64encode(item).decode("utf-8")
+            msg = {
+                "event": "playAudio",
+                "media": {
+                    "contentType": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "payload": payload_b64,
+                },
+            }
+            try:
+                await websocket.send_text(json.dumps(msg))
+            except Exception as e:
+                logger.warning(f"[SEND] WebSocket send failed: {e}")
+                break
+
+    except asyncio.TimeoutError:
+        logger.info(f"[SEND] No audio queued for 30s for {call_uuid} — send loop idle.")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"[SEND] Unexpected error in send loop: {e}")
+
+
+async def _run_pipeline(
+    call_uuid: str,
+    user_text: str,
+    campaign_id: uuid.UUID,
+    customer_id: uuid.UUID,
+    audio_queue: asyncio.Queue,
+    cancel_event: asyncio.Event,
+    sm: CallStateMachine,
+    llm_lock: asyncio.Lock,
+) -> None:
+    """
+    STT result → LLM → TTS.
+    Guarded by llm_lock to prevent concurrent requests.
+    TTS frames are pushed into audio_queue for _send_loop to deliver.
+    """
+
+    # ── THINKING ──────────────────────────────────────────────────────────
+    await sm.transition(CallState.THINKING)
+
+    response_text: str = ""
+    should_hangup: bool = False
+
+    async with llm_lock:
+        try:
+            async for db in get_db_session():
+                engine = ConversationEngine(db)
+                response_text, should_hangup, _ = await engine.process_turn(
+                    call_id=call_uuid,
+                    campaign_id=campaign_id,
+                    customer_id=customer_id,
+                    user_text=user_text,
+                )
+                break
+        except Exception as e:
+            logger.error(f"[PIPELINE] LLM error for {call_uuid}: {e}")
+            response_text = "I'm sorry, I had trouble understanding that. Could you say it again?"
+
+    logger.info(f"[PIPELINE] LLM response: '{response_text[:120]}...'")
+
+    if not response_text:
+        logger.warning(f"[PIPELINE] Empty LLM response for {call_uuid}")
+        await sm.transition(CallState.WAITING_FOR_CUSTOMER)
+        return
+
+    # ── GENERATING_RESPONSE ───────────────────────────────────────────────
+    await sm.transition(CallState.GENERATING_RESPONSE)
+
+    # ── AI_SPEAKING ───────────────────────────────────────────────────────
+    tts = VoiceService()
+    cancel_event.clear()  # Fresh cancellation token for this utterance
+    await sm.transition(CallState.AI_SPEAKING)
+
+    try:
+        async for audio_chunk in tts.stream_speech(response_text, cancel_event=cancel_event):
+            if cancel_event.is_set():
+                logger.info(f"[PIPELINE] TTS cancelled mid-stream for {call_uuid}")
+                break
+            await audio_queue.put(audio_chunk)
+    except Exception as e:
+        logger.error(f"[PIPELINE] TTS streaming error: {e}")
+
+    if not cancel_event.is_set():
+        # Finished naturally — transition to waiting
+        if should_hangup:
+            logger.info(f"[PIPELINE] Conversation complete for {call_uuid}. Transitioning to COMPLETED.")
+            await sm.transition(CallState.CALL_COMPLETED)
+        else:
+            await sm.transition(CallState.WAITING_FOR_CUSTOMER)
+    # If cancelled, _recv_loop already transitioned to CUSTOMER_SPEAKING
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main WebSocket handler
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.websocket("/telephony/stream/{call_uuid}")
 async def plivo_audio_stream_websocket(
     websocket: WebSocket,
-    call_uuid: str
-):
-    """Bidirectional WebSocket handling incoming Plivo JSON frames and returning audio."""
+    call_uuid: str,
+) -> None:
+    """
+    Bidirectional Plivo media stream WebSocket.
+
+    Runs three concurrent tasks:
+      - _recv_loop: reads all incoming frames, manages VAD + utterance buffering
+      - _send_loop: writes queued TTS audio frames to Plivo
+      - pipeline task (spawned per utterance): STT → LLM → TTS
+    """
     await websocket.accept()
-    logger.info(f"Plivo Audio Stream WebSocket connection accepted: {call_uuid}")
-    
-    # Initialize pipeline checkers (VAD threshold set higher to prevent line noise false interruptions)
-    vad = VADService(threshold=4500.0)
+    logger.info(f"[WS] WebSocket accepted for {call_uuid}")
+
+    # ── Shared state ──────────────────────────────────────────────────────
+    sm = CallStateMachine(call_uuid)
+    audio_queue: asyncio.Queue = asyncio.Queue()
+    llm_lock = asyncio.Lock()
+
+    # cancel_event is set to abort current TTS stream on barge-in
+    cancel_event = asyncio.Event()
+
+    # Per-utterance audio accumulation buffer (reset on each utterance)
+    utterance_buffer = bytearray()
+
+    # VAD
+    vad = EndOfSpeechDetector()
     stt = SpeechService()
-    tts = VoiceService()
-    
-    bot_is_speaking = False
-    
+
+    # Active pipeline task (STT→LLM→TTS)
+    pipeline_task: Optional[asyncio.Task] = None
+
+    # campaign / customer IDs resolved once on stream start
+    campaign_id: Optional[uuid.UUID] = None
+    customer_id: Optional[uuid.UUID] = None
+
+    async def _barge_in() -> None:
+        """Stop current AI speech and transition to CUSTOMER_SPEAKING."""
+        nonlocal pipeline_task
+        logger.info(f"[BARGE-IN] Customer interrupted AI speech for {call_uuid}")
+        cancel_event.set()                     # Abort TTS stream
+        audio_queue.put_nowait(_STOP_SENTINEL) # Clear Plivo buffer
+        vad.reset()
+        utterance_buffer.clear()
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+            try:
+                await asyncio.shield(pipeline_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+            pipeline_task = None
+        await sm.transition(CallState.CUSTOMER_SPEAKING)
+
+    async def _fire_greeting() -> None:
+        """Fire the initial AI greeting on stream start."""
+        nonlocal campaign_id, customer_id, pipeline_task
+        campaign_id, customer_id = await _resolve_call_context(call_uuid)
+        if not campaign_id or not customer_id:
+            logger.error(f"[WS] Could not resolve context for {call_uuid}. Aborting.")
+            await sm.transition(CallState.ERROR)
+            return
+
+        logger.info(f"[WS] Firing greeting for {call_uuid} (campaign={campaign_id})")
+        pipeline_task = asyncio.create_task(
+            _run_pipeline(
+                call_uuid=call_uuid,
+                user_text="Hello",
+                campaign_id=campaign_id,
+                customer_id=customer_id,
+                audio_queue=audio_queue,
+                cancel_event=cancel_event,
+                sm=sm,
+                llm_lock=llm_lock,
+            )
+        )
+
+    # ── Start the send loop as a background task ──────────────────────────
+    send_task = asyncio.create_task(
+        _send_loop(websocket, audio_queue, call_uuid, sm)
+    )
+
+    # ── Main receive loop (runs in the foreground) ────────────────────────
     try:
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
+        while not sm.is_terminal():
+            try:
+                raw_message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=60.0  # Drop call if Plivo goes silent for 60s
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[WS] No data from Plivo for 60s on {call_uuid} — closing.")
+                break
+
+            data = json.loads(raw_message)
             event = data.get("event")
-            
+
+            # ── stream start ─────────────────────────────────────────────
             if event == "start":
-                start_data = data.get("start", {})
-                logger.info(f"Stream started for Call UUID {call_uuid}. Stream ID: {start_data.get('streamId') or start_data.get('streamSid')}")
-                
-                # Trigger the initial greeting outbound flow immediately
-                logger.info(f"Triggering initial greeting for Call UUID {call_uuid}...")
-                campaign_id, customer_id = await _resolve_call_context(call_uuid)
-                        
-                if campaign_id and customer_id:
-                    response_text = ""
-                    should_hangup = False
-                    async for db in get_db_session():
-                        engine = ConversationEngine(db)
-                        response_text, should_hangup, _ = await engine.process_turn(
-                            call_id=call_uuid,
-                            campaign_id=campaign_id,
-                            customer_id=customer_id,
-                            user_text="Hello"
-                        )
-                        break
-                        
-                    if response_text:
-                        bot_is_speaking = True
-                        async for audio_chunk in tts.stream_speech(response_text):
-                            if not bot_is_speaking:
-                                break
-                            payload_out = base64.b64encode(audio_chunk).decode("utf-8")
-                            reply_msg = {
-                                "event": "playAudio",
-                                "media": {
-                                    "contentType": "audio/x-mulaw",
-                                    "sampleRate": 8000,
-                                    "payload": payload_out
-                                }
-                            }
-                            try:
-                                await websocket.send_text(json.dumps(reply_msg))
-                            except Exception:
-                                bot_is_speaking = False
-                                break
-                        bot_is_speaking = False
-                        
-                        if should_hangup:
-                            logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
-                            try:
-                                await websocket.close()
-                            except Exception:
-                                pass
-                            break
-                
+                stream_info = data.get("start", {})
+                logger.info(
+                    f"[WS] Stream started for {call_uuid}. "
+                    f"StreamID: {stream_info.get('streamId') or stream_info.get('streamSid')}"
+                )
+                await _fire_greeting()
+
+            # ── incoming audio frame ──────────────────────────────────────
             elif event == "media":
                 media_data = data.get("media", {})
-                payload = media_data.get("payload", "")
-                
+                payload_b64 = media_data.get("payload", "")
+                if not payload_b64:
+                    continue
+
                 try:
-                    raw_audio = base64.b64decode(payload)
-                    
-                    # 1. Voice Activity Detection Interruption Check
-                    is_user_speaking = vad.is_speech(raw_audio)
-                    if is_user_speaking and bot_is_speaking:
-                        logger.info(f"User speech detected. Interrupting bot speech for Call {call_uuid}.")
-                        bot_is_speaking = False
-                        # Send clearAudio command to Plivo to flush voice buffers
-                        await websocket.send_text(json.dumps({"event": "clearAudio"}))
-                        
-                    # 2. Feed to Streaming STT
-                    transcript = await stt.transcribe_chunk(raw_audio)
-                    if transcript:
-                        logger.info(f"STT Transcript captured: '{transcript}'")
-                        
-                        # 3. Retrieve context and run Conversation Turn
-                        campaign_id, customer_id = await _resolve_call_context(call_uuid)
-                                
-                        if not campaign_id or not customer_id:
-                            campaign_id = uuid.uuid4()
-                            customer_id = uuid.uuid4()
-                            
-                        response_text = ""
-                        should_hangup = False
-                        async for db in get_db_session():
-                            engine = ConversationEngine(db)
-                            response_text, should_hangup, _ = await engine.process_turn(
-                                call_id=call_uuid,
+                    raw_audio = base64.b64decode(payload_b64)
+                except Exception:
+                    continue
+
+                # ── If AI is currently speaking, only check for barge-in ──
+                if sm.is_ai_speaking():
+                    vad_event = vad.process_frame(raw_audio)
+                    if vad_event == "speech_start":
+                        await _barge_in()
+                    # Do NOT accumulate utterance buffer while bot is speaking
+                    # (would capture bot's own echoed audio)
+                    continue
+
+                # ── If in a terminal/non-listening state, ignore audio ────
+                if sm.state in (
+                    CallState.TRANSCRIBING,
+                    CallState.THINKING,
+                    CallState.GENERATING_RESPONSE,
+                    CallState.CALL_COMPLETED,
+                    CallState.ERROR,
+                ):
+                    continue
+
+                # ── VAD processing for WAITING / CUSTOMER_SPEAKING ────────
+                vad_event = vad.process_frame(raw_audio)
+                utterance_buffer.extend(raw_audio)
+
+                if vad_event == "speech_start":
+                    if sm.is_waiting():
+                        logger.info(f"[VAD] Speech start detected for {call_uuid}")
+                        await sm.transition(CallState.CUSTOMER_SPEAKING)
+
+                elif vad_event == "speech_end":
+                    if sm.state == CallState.CUSTOMER_SPEAKING:
+                        logger.info(f"[VAD] End of speech detected — firing STT for {call_uuid}")
+                        await sm.transition(CallState.TRANSCRIBING)
+
+                        # Grab and clear the utterance buffer
+                        utterance_bytes = bytes(utterance_buffer)
+                        utterance_buffer.clear()
+                        vad.reset()
+
+                        # STT → LLM → TTS in background task
+                        async def _transcribe_and_pipeline(audio: bytes) -> None:
+                            nonlocal pipeline_task
+                            # 1. STT
+                            transcript = await stt.transcribe_utterance(audio)
+                            if not transcript:
+                                logger.info(f"[STT] Empty transcript for {call_uuid} — returning to WAITING")
+                                await sm.transition(CallState.WAITING_FOR_CUSTOMER)
+                                return
+
+                            logger.info(f"[STT] Transcript: '{transcript}' for {call_uuid}")
+
+                            # 2. Ensure context is resolved
+                            nonlocal campaign_id, customer_id
+                            if not campaign_id or not customer_id:
+                                campaign_id, customer_id = await _resolve_call_context(call_uuid)
+
+                            if not campaign_id or not customer_id:
+                                logger.error(f"[WS] Context still unresolved for {call_uuid}")
+                                await sm.transition(CallState.WAITING_FOR_CUSTOMER)
+                                return
+
+                            # 3. LLM → TTS
+                            await _run_pipeline(
+                                call_uuid=call_uuid,
+                                user_text=transcript,
                                 campaign_id=campaign_id,
                                 customer_id=customer_id,
-                                user_text=transcript
+                                audio_queue=audio_queue,
+                                cancel_event=cancel_event,
+                                sm=sm,
+                                llm_lock=llm_lock,
                             )
-                            break
-                            
-                        # 4. Trigger TTS Audio Streaming back to Plivo
-                        if response_text:
-                            bot_is_speaking = True
-                            async for audio_chunk in tts.stream_speech(response_text):
-                                if not bot_is_speaking:
-                                    # Interrupt mid-stream
-                                    break
-                                    
-                                payload_out = base64.b64encode(audio_chunk).decode("utf-8")
-                                reply_msg = {
-                                    "event": "playAudio",
-                                    "media": {
-                                        "contentType": "audio/x-mulaw",
-                                        "sampleRate": 8000,
-                                        "payload": payload_out
-                                    }
-                                }
-                                try:
-                                    await websocket.send_text(json.dumps(reply_msg))
-                                except Exception:
-                                    bot_is_speaking = False
-                                    break
-                                
-                            bot_is_speaking = False
-                            
-                            if should_hangup:
-                                logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
-                                try:
-                                    await websocket.close()
-                                except Exception:
-                                    pass
-                                break
-                            
-                except Exception as e:
-                    logger.warning(f"Error handling media frame: {e}")
-                    
+
+                        pipeline_task = asyncio.create_task(
+                            _transcribe_and_pipeline(utterance_bytes)
+                        )
+
+            # ── stream stop ───────────────────────────────────────────────
             elif event == "stop":
-                logger.info(f"Stream stopped for Call UUID {call_uuid}")
+                logger.info(f"[WS] Stream stopped by Plivo for {call_uuid}")
                 break
-                
+
     except WebSocketDisconnect:
-        logger.info(f"Stream WebSocket disconnected for Call UUID {call_uuid}")
+        logger.info(f"[WS] WebSocket disconnected for {call_uuid}")
     except Exception as e:
-        logger.error(f"Error in stream WebSocket session: {e}")
-        await websocket.close()
+        logger.error(f"[WS] Unhandled exception in receive loop for {call_uuid}: {e}", exc_info=True)
+    finally:
+        # ── Cleanup ───────────────────────────────────────────────────────
+        logger.info(f"[WS] Cleaning up tasks for {call_uuid} (final state: {sm.state.name})")
+
+        # Cancel any in-flight pipeline task
+        if pipeline_task and not pipeline_task.done():
+            pipeline_task.cancel()
+            try:
+                await asyncio.shield(pipeline_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Signal send loop to stop
+        audio_queue.put_nowait(None)
+        cancel_event.set()
+        send_task.cancel()
+        try:
+            await asyncio.shield(send_task)
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        # Close WebSocket if still open
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+        logger.info(f"[WS] Session closed for {call_uuid}")
