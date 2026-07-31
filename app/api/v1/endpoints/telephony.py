@@ -78,7 +78,7 @@ async def plivo_answer_webhook(
         logger.error(f"Error linking call_uuid in answer webhook: {e}")
     
     xml_content = f"""<Response>
-    <Stream url="wss://{host}/api/v1/telephony/stream/{call_uuid}"/>
+    <Stream bidirectional="true">wss://{host}/api/v1/telephony/stream/{call_uuid}</Stream>
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
 
@@ -91,7 +91,7 @@ async def plivo_inbound_webhook(request: Request):
     
     xml_content = f"""<Response>
     <Speak>Thank you for calling Mercy Hospital. Please hold while we connect you to our voice coordinator.</Speak>
-    <Stream url="wss://{host}/api/v1/telephony/stream/{call_uuid}"/>
+    <Stream bidirectional="true">wss://{host}/api/v1/telephony/stream/{call_uuid}</Stream>
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
 
