@@ -206,12 +206,19 @@ async def plivo_audio_stream_websocket(
                                     "payload": payload_out
                                 }
                             }
-                            await websocket.send_text(json.dumps(reply_msg))
+                            try:
+                                await websocket.send_text(json.dumps(reply_msg))
+                            except Exception:
+                                bot_is_speaking = False
+                                break
                         bot_is_speaking = False
                         
                         if should_hangup:
                             logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
-                            await websocket.close()
+                            try:
+                                await websocket.close()
+                            except Exception:
+                                pass
                             break
                 
             elif event == "media":
@@ -270,13 +277,20 @@ async def plivo_audio_stream_websocket(
                                         "payload": payload_out
                                     }
                                 }
-                                await websocket.send_text(json.dumps(reply_msg))
+                                try:
+                                    await websocket.send_text(json.dumps(reply_msg))
+                                except Exception:
+                                    bot_is_speaking = False
+                                    break
                                 
                             bot_is_speaking = False
                             
                             if should_hangup:
                                 logger.info(f"LLM completed conversation. Hanging up Call UUID {call_uuid}...")
-                                await websocket.close()
+                                try:
+                                    await websocket.close()
+                                except Exception:
+                                    pass
                                 break
                             
                 except Exception as e:

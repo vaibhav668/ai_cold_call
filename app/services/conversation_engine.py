@@ -163,9 +163,13 @@ class ConversationEngine:
                 
             loop_limit -= 1
             
-        # Detect state flags
+        # Detect state flags (use word boundaries and require history > 3 to avoid hanging up during initial greeting)
+        import re
         low_content = (content or "").lower()
-        if "goodbye" in low_content or "bye" in low_content or state == "completed":
+        farewell_pattern = r'\b(goodbye|bye bye|bye-bye|have a nice day|have a great day)\b'
+        if re.search(farewell_pattern, low_content) and len(history) > 3:
+            should_hangup = True
+        elif state == "completed":
             should_hangup = True
             
         if state == "escalated":
