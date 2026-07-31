@@ -207,12 +207,24 @@ async def _send_loop(
 ) -> None:
     """
     Drains audio_queue and sends playAudio frames to Plivo.
-    A _STOP_SENTINEL in the queue clears the remaining buffer and
-    sends a clearAudio command to Plivo to flush its jitter buffer.
+    Runs for the entire call duration — does NOT exit on idle timeout.
+
+    FIX: Previously, asyncio.TimeoutError was caught outside the while loop,
+    causing the send loop to exit after 30s of no TTS activity. All subsequent
+    TTS frames would queue silently with nobody reading them. The call would
+    appear to work (states transition) but the customer hears nothing.
     """
     try:
         while not sm.is_terminal():
-            item = await asyncio.wait_for(audio_queue.get(), timeout=30.0)
+            # FIX: Inner try-except so TimeoutError continues the loop rather
+            # than breaking out of it. The send loop must stay alive for the
+            # entire call, not just during active TTS playback.
+            try:
+                item = await asyncio.wait_for(audio_queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Normal — no TTS for 30s (customer turn, silence, etc.)
+                logger.debug(f"[SEND] Queue idle for 30s on {call_uuid}, continuing.")
+                continue
 
             if item is _STOP_SENTINEL:
                 # Discard everything else currently queued (mid-stream frames)
@@ -232,7 +244,7 @@ async def _send_loop(
                 continue
 
             if item is None:
-                # None = shutdown signal from pipeline
+                # None = graceful shutdown signal
                 break
 
             payload_b64 = base64.b64encode(item).decode("utf-8")
@@ -250,8 +262,6 @@ async def _send_loop(
                 logger.warning(f"[SEND] WebSocket send failed: {e}")
                 break
 
-    except asyncio.TimeoutError:
-        logger.info(f"[SEND] No audio queued for 30s for {call_uuid} — send loop idle.")
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -473,25 +483,51 @@ async def plivo_audio_stream_websocket(
 
                 # ── VAD processing for WAITING / CUSTOMER_SPEAKING ────────
                 vad_event = vad.process_frame(raw_audio)
-                utterance_buffer.extend(raw_audio)
+
+                # FIX: Only accumulate utterance audio when customer is actively
+                # speaking. Previously the buffer grew during CONNECTED and
+                # WAITING_FOR_CUSTOMER states, filling it with silence + bot echo
+                # before the customer said anything. Groq Whisper would then
+                # transcribe that noise as empty, and the turn was dropped.
+                if sm.state == CallState.CUSTOMER_SPEAKING:
+                    utterance_buffer.extend(raw_audio)
 
                 if vad_event == "speech_start":
                     if sm.is_waiting():
                         logger.info(f"[VAD] Speech start detected for {call_uuid}")
+                        utterance_buffer.clear()  # Clean slate for this utterance
+                        vad.reset()               # Reset VAD state cleanly
+                        # Re-prime: we know we're in speech now
+                        vad._in_speech = True
+                        vad._speech_confirmed = True
                         await sm.transition(CallState.CUSTOMER_SPEAKING)
 
                 elif vad_event == "speech_end":
                     if sm.state == CallState.CUSTOMER_SPEAKING:
-                        logger.info(f"[VAD] End of speech detected — firing STT for {call_uuid}")
+                        logger.info(f"[VAD] End of speech — firing STT for {call_uuid}")
                         await sm.transition(CallState.TRANSCRIBING)
 
-                        # Grab and clear the utterance buffer
                         utterance_bytes = bytes(utterance_buffer)
                         utterance_buffer.clear()
                         vad.reset()
 
-                        # STT → LLM → TTS in background task
-                        async def _transcribe_and_pipeline(audio: bytes) -> None:
+                        # FIX: Guard against duplicate pipeline tasks.
+                        # If a prior task is still running (shouldn't happen but
+                        # defensive), cancel it before starting a new one.
+                        if pipeline_task and not pipeline_task.done():
+                            logger.warning(f"[WS] Prior pipeline still running for {call_uuid} — cancelling.")
+                            pipeline_task.cancel()
+                            try:
+                                await asyncio.shield(pipeline_task)
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+                        # STT → LLM → TTS
+                        async def _transcribe_and_pipeline(
+                            audio: bytes,
+                            _campaign_id: uuid.UUID = campaign_id,
+                            _customer_id: uuid.UUID = customer_id,
+                        ) -> None:
                             nonlocal pipeline_task
                             # 1. STT
                             transcript = await stt.transcribe_utterance(audio)
@@ -502,13 +538,13 @@ async def plivo_audio_stream_websocket(
 
                             logger.info(f"[STT] Transcript: '{transcript}' for {call_uuid}")
 
-                            # 2. Ensure context is resolved
-                            nonlocal campaign_id, customer_id
-                            if not campaign_id or not customer_id:
-                                campaign_id, customer_id = await _resolve_call_context(call_uuid)
-
-                            if not campaign_id or not customer_id:
-                                logger.error(f"[WS] Context still unresolved for {call_uuid}")
+                            # 2. Resolve context if still missing
+                            _cid = _campaign_id
+                            _uid = _customer_id
+                            if not _cid or not _uid:
+                                _cid, _uid = await _resolve_call_context(call_uuid)
+                            if not _cid or not _uid:
+                                logger.error(f"[WS] Context unresolved for {call_uuid}")
                                 await sm.transition(CallState.WAITING_FOR_CUSTOMER)
                                 return
 
@@ -516,8 +552,8 @@ async def plivo_audio_stream_websocket(
                             await _run_pipeline(
                                 call_uuid=call_uuid,
                                 user_text=transcript,
-                                campaign_id=campaign_id,
-                                customer_id=customer_id,
+                                campaign_id=_cid,
+                                customer_id=_uid,
                                 audio_queue=audio_queue,
                                 cancel_event=cancel_event,
                                 sm=sm,

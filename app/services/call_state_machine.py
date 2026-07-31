@@ -10,7 +10,7 @@ States:
     WAITING_FOR_CUSTOMER   — AI finished, listening for customer to start speaking
     CUSTOMER_SPEAKING      — VAD has detected active customer speech
     TRANSCRIBING           — VAD silence timeout hit; sending utterance to STT
-    THINKING               — STT returned text; LLM request in flight
+    THINKING               — LLM request in flight (STT result OR greeting "Hello")
     GENERATING_RESPONSE    — LLM returned text; TTS synthesis in progress
     CALL_COMPLETED         — Conversation naturally ended; ready to hangup
     ERROR                  — Unrecoverable error; call should be terminated
@@ -34,15 +34,21 @@ class CallState(Enum):
 
 
 # Valid transitions: state → set of allowed next states
+#
+# FIX: CONNECTED must allow THINKING and GENERATING_RESPONSE because
+# _run_pipeline is shared between the greeting and regular turns.
+# The greeting pipeline enters: CONNECTED → THINKING → GENERATING_RESPONSE → AI_SPEAKING.
 _VALID_TRANSITIONS: dict[CallState, set[CallState]] = {
     CallState.CONNECTED: {
-        CallState.AI_SPEAKING,   # greeting
-        CallState.WAITING_FOR_CUSTOMER,
+        CallState.THINKING,             # greeting — LLM call
+        CallState.GENERATING_RESPONSE,  # greeting — TTS synthesis
+        CallState.AI_SPEAKING,          # greeting — start speaking
+        CallState.WAITING_FOR_CUSTOMER, # context resolution failed gracefully
         CallState.ERROR,
     },
     CallState.AI_SPEAKING: {
-        CallState.WAITING_FOR_CUSTOMER,   # finished normally
-        CallState.CUSTOMER_SPEAKING,      # barge-in
+        CallState.WAITING_FOR_CUSTOMER,   # finished naturally
+        CallState.CUSTOMER_SPEAKING,      # barge-in detected
         CallState.CALL_COMPLETED,
         CallState.ERROR,
     },
@@ -53,7 +59,7 @@ _VALID_TRANSITIONS: dict[CallState, set[CallState]] = {
     },
     CallState.CUSTOMER_SPEAKING: {
         CallState.TRANSCRIBING,           # silence timeout → end-of-speech
-        CallState.WAITING_FOR_CUSTOMER,   # very short noise / click
+        CallState.WAITING_FOR_CUSTOMER,   # very short noise / click (spurious)
         CallState.ERROR,
     },
     CallState.TRANSCRIBING: {
@@ -101,8 +107,7 @@ class CallStateMachine:
         Attempt a state transition.
 
         Returns True if transition succeeded, False if it was invalid.
-        Invalid transitions are logged but do NOT raise exceptions — the
-        caller is responsible for handling a False return.
+        Invalid transitions are logged but do NOT raise — caller handles False.
         """
         async with self._lock:
             allowed = _VALID_TRANSITIONS.get(self._state, set())
@@ -119,6 +124,13 @@ class CallStateMachine:
                 f"[STATE] {self.call_uuid} {old_state.name} → {new_state.name}"
             )
             return True
+
+    def force(self, new_state: CallState) -> None:
+        """
+        Unconditionally set state (no lock, no validation).
+        Use only in cleanup/error paths where we cannot await.
+        """
+        self._state = new_state
 
     def is_terminal(self) -> bool:
         return self._state in (CallState.CALL_COMPLETED, CallState.ERROR)

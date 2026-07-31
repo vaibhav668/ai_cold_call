@@ -26,34 +26,44 @@ class EndOfSpeechDetector:
     """
     Stateful VAD with hysteresis for end-of-speech detection.
 
-    State machine:
-        IDLE → SPEAKING (when RMS > speech_threshold for min_speech_frames)
-        SPEAKING → TRAILING_SILENCE (when RMS < silence_threshold)
-        TRAILING_SILENCE → IDLE / speech_ended (when silence_frames > silence_timeout_frames)
-        TRAILING_SILENCE → SPEAKING (if voice resumes before timeout)
+    Calibrated for 8kHz G.711 mu-law phone audio (Indian mobile carriers).
 
-    Yields events: 'speech_start', 'speech_end', or None each frame.
+    Typical decoded PCM RMS ranges observed on Plivo streams:
+        Line static / background: 50 – 200
+        Quiet speech:            200 – 600
+        Normal speech:           400 – 2000
+        Loud speech:            1500 – 5000
+
+    State machine:
+        IDLE → SPEAKING        (RMS > SPEECH_THRESHOLD for MIN_SPEECH_FRAMES consecutive)
+        SPEAKING → TRAILING    (RMS < SILENCE_THRESHOLD)
+        TRAILING → IDLE/END    (silence_frames > SILENCE_TIMEOUT_FRAMES)
+        TRAILING → SPEAKING    (voice resumes before timeout)
+
+    Events returned: 'speech_start', 'speech_end', or None.
     """
 
-    # Tuned for 8kHz G.711 mu-law phone audio
-    SPEECH_THRESHOLD = 900.0    # RMS above this = speech active
-    SILENCE_THRESHOLD = 500.0   # RMS below this = silence
-    MIN_SPEECH_FRAMES = 4       # ~80ms minimum utterance (4 × 20ms frames)
-    SILENCE_TIMEOUT_FRAMES = 25 # ~500ms of silence = end-of-utterance
+    # FIX: Lowered from 900→450 and 500→220 to detect quieter phone speech.
+    # Requiring 4 consecutive frames above 900 was too strict — any dip reset
+    # the counter, so speech on Indian mobile carriers was never confirmed.
+    SPEECH_THRESHOLD = 450.0    # RMS above this = speech active
+    SILENCE_THRESHOLD = 220.0   # RMS below this = silence
+    MIN_SPEECH_FRAMES = 3       # ~60ms minimum utterance (3 × 20ms)
+    SILENCE_TIMEOUT_FRAMES = 20 # ~400ms silence = end-of-utterance
 
     def __init__(self) -> None:
         self._in_speech = False
         self._speech_frames = 0
         self._silence_frames = 0
-        self._speech_confirmed = False  # True once MIN_SPEECH_FRAMES reached
+        self._speech_confirmed = False
 
     def process_frame(self, audio_chunk: bytes) -> str | None:
         """
         Process one 20ms audio frame.
 
         Returns:
-            'speech_start'  — customer just started speaking (confirmed)
-            'speech_end'    — customer finished speaking (silence timeout hit)
+            'speech_start'  — customer confirmed speaking
+            'speech_end'    — customer finished utterance
             None            — no event this frame
         """
         rms = _rms(audio_chunk)
@@ -67,26 +77,26 @@ class EndOfSpeechDetector:
                     self._silence_frames = 0
                     return 'speech_start'
             else:
-                self._speech_frames = 0
+                # FIX: Don't fully reset on a single sub-threshold frame.
+                # Decrement gradually so occasional dips don't cancel build-up.
+                self._speech_frames = max(0, self._speech_frames - 1)
         else:
-            # Currently in speech
             if rms < self.SILENCE_THRESHOLD:
                 self._silence_frames += 1
                 if self._silence_frames >= self.SILENCE_TIMEOUT_FRAMES:
-                    # End of utterance
                     self._in_speech = False
                     self._speech_frames = 0
                     self._silence_frames = 0
                     self._speech_confirmed = False
                     return 'speech_end'
             else:
-                # Voice resumed during silence window — reset silence counter
+                # Voice resumed during silence window
                 self._silence_frames = 0
 
         return None
 
     def reset(self) -> None:
-        """Reset all state (call when barge-in clears or new turn starts)."""
+        """Reset all state (call on barge-in or new turn start)."""
         self._in_speech = False
         self._speech_frames = 0
         self._silence_frames = 0
@@ -98,11 +108,10 @@ class EndOfSpeechDetector:
 
 
 class VADService:
-    """Legacy single-frame is_speech check preserved for backwards compatibility."""
+    """Legacy single-frame is_speech check preserved for backward compatibility."""
 
-    def __init__(self, threshold: float = 900.0) -> None:
+    def __init__(self, threshold: float = 450.0) -> None:
         self.threshold = threshold
 
     def is_speech(self, audio_chunk: bytes) -> bool:
-        """Determines if audio chunk volume exceeds threshold."""
         return _rms(audio_chunk) > self.threshold
