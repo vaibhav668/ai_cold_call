@@ -206,23 +206,30 @@ async def _send_loop(
     sm: CallStateMachine,
 ) -> None:
     """
-    Drains audio_queue and sends playAudio frames to Plivo.
+    Drains audio_queue and sends playAudio G.711 frames to Plivo.
     Runs for the entire call duration — does NOT exit on idle timeout.
 
-    FIX: Previously, asyncio.TimeoutError was caught outside the while loop,
-    causing the send loop to exit after 30s of no TTS activity. All subsequent
-    TTS frames would queue silently with nobody reading them. The call would
-    appear to work (states transition) but the customer hears nothing.
+    FIX: Previously, the echo blanking window (sm.ai_speech_start_time) was set
+    at the moment the state machine transitioned to AI_SPEAKING. However, EdgeTTS
+    takes 1.2s to fetch and decode the audio before any chunks are queued. The
+    blanking window expired before synthesis even finished, causing immediate
+    self-barge-in. We now update ai_speech_start_time when the first frame is actually sent.
     """
     try:
+        first_frame_sent = False
+        chunks_sent = 0
+
         while not sm.is_terminal():
-            # FIX: Inner try-except so TimeoutError continues the loop rather
-            # than breaking out of it. The send loop must stay alive for the
-            # entire call, not just during active TTS playback.
+            # Reset first frame state when bot transitions away from AI_SPEAKING
+            if not sm.is_ai_speaking():
+                if first_frame_sent:
+                    logger.info(f"[SEND] Bot finished speaking/was interrupted. Sent {chunks_sent} chunks for {call_uuid}")
+                first_frame_sent = False
+                chunks_sent = 0
+
             try:
                 item = await asyncio.wait_for(audio_queue.get(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Normal — no TTS for 30s (customer turn, silence, etc.)
                 logger.debug(f"[SEND] Queue idle for 30s on {call_uuid}, continuing.")
                 continue
 
@@ -241,11 +248,20 @@ async def _send_loop(
                     logger.info(f"[SEND] clearAudio sent to Plivo for {call_uuid}")
                 except Exception:
                     pass
+                first_frame_sent = False
+                chunks_sent = 0
                 continue
 
             if item is None:
                 # None = graceful shutdown signal
                 break
+
+            # If we are in AI_SPEAKING and this is the first frame being sent,
+            # activate the echo blanking window *now*
+            if sm.is_ai_speaking() and not first_frame_sent:
+                sm.ai_speech_start_time = asyncio.get_event_loop().time()
+                first_frame_sent = True
+                logger.info(f"[SEND] First audio frame sent. Echo blanking window starts now for {call_uuid}")
 
             payload_b64 = base64.b64encode(item).decode("utf-8")
             msg = {
@@ -257,7 +273,10 @@ async def _send_loop(
                 },
             }
             try:
-                await websocket.send_text(json.dumps(msg))
+                await websocket.send_text(msg if isinstance(msg, str) else json.dumps(msg))
+                chunks_sent += 1
+                if chunks_sent % 50 == 1:
+                    logger.info(f"[SEND] Streaming audio chunk {chunks_sent} to Plivo for {call_uuid}")
             except Exception as e:
                 logger.warning(f"[SEND] WebSocket send failed: {e}")
                 break
@@ -283,9 +302,11 @@ async def _run_pipeline(
     Guarded by llm_lock to prevent concurrent requests.
     TTS frames are pushed into audio_queue for _send_loop to deliver.
     """
+    logger.info(f"[PIPELINE] Pipeline started for {call_uuid} with input text: '{user_text}'")
 
     # ── THINKING ──────────────────────────────────────────────────────────
     await sm.transition(CallState.THINKING)
+    logger.info(f"[PIPELINE] Sending prompt to LLM for {call_uuid}")
 
     response_text: str = ""
     should_hangup: bool = False
@@ -305,7 +326,7 @@ async def _run_pipeline(
             logger.error(f"[PIPELINE] LLM error for {call_uuid}: {e}")
             response_text = "I'm sorry, I had trouble understanding that. Could you say it again?"
 
-    logger.info(f"[PIPELINE] LLM response: '{response_text[:120]}...'")
+    logger.info(f"[PIPELINE] LLM response received: '{response_text[:120]}...'")
 
     if not response_text:
         logger.warning(f"[PIPELINE] Empty LLM response for {call_uuid}")
@@ -314,6 +335,7 @@ async def _run_pipeline(
 
     # ── GENERATING_RESPONSE ───────────────────────────────────────────────
     await sm.transition(CallState.GENERATING_RESPONSE)
+    logger.info(f"[PIPELINE] Starting TTS synthesis for: '{response_text[:60]}...'")
 
     # ── AI_SPEAKING ───────────────────────────────────────────────────────
     tts = VoiceService()
@@ -321,11 +343,14 @@ async def _run_pipeline(
     await sm.transition(CallState.AI_SPEAKING)
 
     try:
+        chunks_queued = 0
         async for audio_chunk in tts.stream_speech(response_text, cancel_event=cancel_event):
             if cancel_event.is_set():
-                logger.info(f"[PIPELINE] TTS cancelled mid-stream for {call_uuid}")
+                logger.info(f"[PIPELINE] TTS cancelled mid-stream (barge-in) for {call_uuid}")
                 break
             await audio_queue.put(audio_chunk)
+            chunks_queued += 1
+        logger.info(f"[PIPELINE] TTS complete. Queued {chunks_queued} audio chunks (queue size: {audio_queue.qsize()})")
     except Exception as e:
         logger.error(f"[PIPELINE] TTS streaming error: {e}")
 

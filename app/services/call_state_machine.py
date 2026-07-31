@@ -126,7 +126,7 @@ class CallStateMachine:
             # Track timestamps for echo blanking windows
             loop_time = asyncio.get_event_loop().time()
             if new_state == CallState.AI_SPEAKING:
-                self.ai_speech_start_time = loop_time
+                self.ai_speech_start_time = 999999999.0  # Prime with safe placeholder: send loop sets actual play time
             elif new_state == CallState.WAITING_FOR_CUSTOMER:
                 self.waiting_start_time = loop_time
 
