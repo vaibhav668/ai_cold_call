@@ -76,10 +76,12 @@ def get_engine():
                 else:
                     raise e
             
-            # Reconstruct DATABASE_URL with resolved IPv4
-            if original_host != resolved_ip:
+            # Reconstruct DATABASE_URL with resolved IP (only for local connections to prevent SSL hostname verification issues)
+            if original_host != resolved_ip and original_host in ("localhost", "127.0.0.1"):
                 netloc = parsed_url.netloc
-                new_netloc = netloc.replace(original_host, resolved_ip, 1)
+                # If resolved_ip is IPv6 (contains colons), wrap it in square brackets
+                resolved_ip_formatted = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
+                new_netloc = netloc.replace(original_host, resolved_ip_formatted, 1)
                 db_url = parsed_url._replace(netloc=new_netloc).geturl()
             else:
                 db_url = settings.DATABASE_URL
@@ -87,8 +89,6 @@ def get_engine():
             # Set connection ssl arguments for remote database instances
             if original_host not in ("localhost", "127.0.0.1"):
                 connect_args["ssl"] = "require"
-                if original_host != resolved_ip:
-                    connect_args["server_hostname"] = original_host
         else:
             db_url = settings.DATABASE_URL
 
@@ -181,13 +181,28 @@ def run_db_diagnostics() -> None:
     if host not in ("localhost", "127.0.0.1"):
         logger.info("SSL Enabled: YES")
         try:
-            context = ssl.create_default_context()
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5.0)
-            ssl_conn = context.wrap_socket(s, server_hostname=host)
-            ssl_conn.connect((ip, port))
-            logger.info("SSL Handshake/Negotiation: SUCCESS")
-            ssl_conn.close()
+            s.connect((ip, port))
+            
+            # Send Postgres SSLRequest packet: length 8, code 80877103 (0x04D2162F)
+            s.sendall(b'\x00\x00\x00\x08\x04\xd2\x16\x2f')
+            resp = s.recv(1)
+            
+            if resp == b'S':
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                ssl_conn = context.wrap_socket(s, server_hostname=host)
+                ssl_conn.do_handshake()
+                logger.info("SSL Handshake/Negotiation: SUCCESS")
+                ssl_conn.close()
+            elif resp == b'N':
+                logger.warning("SSL Handshake/Negotiation: Server rejected SSL (b'N')")
+                s.close()
+            else:
+                logger.warning(f"SSL Handshake/Negotiation: Unexpected server response: {resp}")
+                s.close()
         except Exception as e:
             logger.error(f"SSL Handshake/Negotiation: FAILED: {e}")
             if is_testing:
