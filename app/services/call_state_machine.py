@@ -96,6 +96,8 @@ class CallStateMachine:
         self.call_uuid = call_uuid
         self._state = CallState.CONNECTED
         self._lock = asyncio.Lock()
+        self.ai_speech_start_time = 0.0
+        self.waiting_start_time = 0.0
         logger.info(f"[STATE] {call_uuid} → CONNECTED")
 
     @property
@@ -120,6 +122,14 @@ class CallStateMachine:
 
             old_state = self._state
             self._state = new_state
+            
+            # Track timestamps for echo blanking windows
+            loop_time = asyncio.get_event_loop().time()
+            if new_state == CallState.AI_SPEAKING:
+                self.ai_speech_start_time = loop_time
+            elif new_state == CallState.WAITING_FOR_CUSTOMER:
+                self.waiting_start_time = loop_time
+
             logger.info(
                 f"[STATE] {self.call_uuid} {old_state.name} → {new_state.name}"
             )

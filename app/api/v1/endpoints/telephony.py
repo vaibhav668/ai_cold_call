@@ -464,11 +464,15 @@ async def plivo_audio_stream_websocket(
 
                 # ── If AI is currently speaking, only check for barge-in ──
                 if sm.is_ai_speaking():
-                    vad_event = vad.process_frame(raw_audio)
-                    if vad_event == "speech_start":
-                        await _barge_in()
+                    # FIX: Blanking window (1.2s) to ignore initial G.711 echo of the bot's own voice
+                    loop_time = asyncio.get_event_loop().time()
+                    if loop_time - sm.ai_speech_start_time > 1.2:
+                        vad_event = vad.process_frame(raw_audio)
+                        if vad_event == "speech_start":
+                            await _barge_in()
+                    else:
+                        vad.reset()
                     # Do NOT accumulate utterance buffer while bot is speaking
-                    # (would capture bot's own echoed audio)
                     continue
 
                 # ── If in a terminal/non-listening state, ignore audio ────
@@ -482,6 +486,13 @@ async def plivo_audio_stream_websocket(
                     continue
 
                 # ── VAD processing for WAITING / CUSTOMER_SPEAKING ────────
+                # FIX: Post-speech blanking window (0.6s) to ignore residual G.711 echo
+                # of the bot's voice right after it stops speaking.
+                loop_time = asyncio.get_event_loop().time()
+                if sm.is_waiting() and (loop_time - sm.waiting_start_time < 0.6):
+                    vad.reset()
+                    continue
+
                 vad_event = vad.process_frame(raw_audio)
 
                 # FIX: Only accumulate utterance audio when customer is actively
