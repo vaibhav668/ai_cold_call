@@ -478,6 +478,13 @@ async def plivo_audio_stream_websocket(
             # ── incoming audio frame ──────────────────────────────────────
             elif event == "media":
                 media_data = data.get("media", {})
+                
+                # FIX: Plivo bidirectional stream sends both "inbound" (customer)
+                # and "outbound" (bot) tracks. We must strictly ignore non-inbound
+                # tracks to avoid feeding the bot's own speech back into the VAD.
+                if media_data.get("track") != "inbound":
+                    continue
+
                 payload_b64 = media_data.get("payload", "")
                 if not payload_b64:
                     continue
