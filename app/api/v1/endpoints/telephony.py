@@ -520,20 +520,27 @@ async def plivo_audio_stream_websocket(
 
                 vad_event = vad.process_frame(raw_audio)
 
-                # FIX: Only accumulate utterance audio when customer is actively
-                # speaking. Previously the buffer grew during CONNECTED and
-                # WAITING_FOR_CUSTOMER states, filling it with silence + bot echo
-                # before the customer said anything. Groq Whisper would then
-                # transcribe that noise as empty, and the turn was dropped.
+                # Log VAD metrics every 100 frames (~2s)
+                if not hasattr(websocket, "_frame_count"):
+                    websocket._frame_count = 0
+                websocket._frame_count += 1
+                if websocket._frame_count % 100 == 1:
+                    from app.services.vad_service import _rms
+                    rms_val = _rms(raw_audio)
+                    logger.info(
+                        f"[VAD DIALOG] Call {call_uuid} | State: {sm.state.name} | "
+                        f"RMS: {rms_val:.1f} | Noise Floor: {vad.noise_floor:.1f} | "
+                        f"Speech Thresh: {vad.speech_threshold:.1f} | Silence Thresh: {vad.silence_threshold:.1f}"
+                    )
+
                 if sm.state == CallState.CUSTOMER_SPEAKING:
                     utterance_buffer.extend(raw_audio)
 
                 if vad_event == "speech_start":
                     if sm.is_waiting():
                         logger.info(f"[VAD] Speech start detected for {call_uuid}")
-                        utterance_buffer.clear()  # Clean slate for this utterance
-                        vad.reset()               # Reset VAD state cleanly
-                        # Re-prime: we know we're in speech now
+                        utterance_buffer.clear()
+                        vad.reset()
                         vad._in_speech = True
                         vad._speech_confirmed = True
                         await sm.transition(CallState.CUSTOMER_SPEAKING)
