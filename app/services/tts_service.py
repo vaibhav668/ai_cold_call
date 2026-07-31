@@ -10,6 +10,58 @@ class TextToSpeechProvider(ABC):
         """Convert text into streamed G.711 mu-law raw audio bytes."""
         yield b""
 
+def linear2ulaw(sample: int) -> int:
+    """Converts a 16-bit signed linear PCM sample (-32768 to 32767) to 8-bit G.711 u-law."""
+    BIAS = 0x84
+    CLIP = 32635
+    sign = (sample >> 8) & 0x80
+    if sign != 0:
+        sample = -sample
+    if sample > CLIP:
+        sample = CLIP
+    sample = sample + BIAS
+    exponent = 7
+    exp_mask = 0x4000
+    while (sample & exp_mask) == 0 and exponent > 0:
+        exponent -= 1
+        exp_mask >>= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    ulaw_byte = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return ulaw_byte
+
+class EdgeTTSProvider(TextToSpeechProvider):
+    def __init__(self, voice: str = "en-US-AriaNeural") -> None:
+        self.voice = voice
+
+    async def stream_speech(self, text: str) -> AsyncGenerator[bytes, None]:
+        try:
+            import edge_tts
+            import miniaudio
+            
+            communicate = edge_tts.Communicate(text, self.voice)
+            mp3_bytes = b""
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_bytes += chunk["data"]
+                    
+            if not mp3_bytes:
+                logger.warning("Edge TTS returned empty audio. Falling back to mock TTS.")
+                async for chunk in MockTTSProvider().stream_speech(text):
+                    yield chunk
+                return
+                
+            decoded = miniaudio.decode(mp3_bytes, sample_rate=8000, nchannels=1, output_format=miniaudio.SampleFormat.SIGNED16)
+            mulaw_bytes = bytes(linear2ulaw(s) for s in decoded.samples)
+            
+            # Slice into 160-byte (20ms) frames for Plivo streaming
+            for i in range(0, len(mulaw_bytes), 160):
+                yield mulaw_bytes[i:i+160]
+                
+        except Exception as e:
+            logger.warning(f"Edge TTS synthesis failed: {e}. Falling back to mock TTS.")
+            async for chunk in MockTTSProvider().stream_speech(text):
+                yield chunk
+
 class CoquiXTTSProvider(TextToSpeechProvider):
     def __init__(self) -> None:
         self.tts = None
@@ -19,29 +71,22 @@ class CoquiXTTSProvider(TextToSpeechProvider):
             try:
                 from TTS.api import TTS
                 logger.info("Initializing local Coqui XTTS v2 model on CPU...")
-                # Lazy loading Coqui XTTS model
                 self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
             except Exception as e:
-                logger.warning(f"Could not load local Coqui XTTS model: {e}. Falling back to mock TTS.")
+                logger.warning(f"Could not load local Coqui XTTS model: {e}. Falling back to Edge TTS.")
                 self.tts = None
 
     async def stream_speech(self, text: str) -> AsyncGenerator[bytes, None]:
         self._init_tts()
         if not self.tts:
-            mock = MockTTSProvider()
-            async for chunk in mock.stream_speech(text):
+            async for chunk in EdgeTTSProvider().stream_speech(text):
                 yield chunk
             return
 
         try:
-            # XTTS synthesizes audio to file.
-            # We clone the voice of a default speaker from static assets if available.
             temp_wav = os.path.join(tempfile.gettempdir(), "xtts_output.wav")
-            
-            # Simple reference speaker wav path (uses a placeholder or dummy sample)
             ref_speaker = "static/samples/speaker.wav"
             if not os.path.exists(ref_speaker):
-                # Fallback to creating a dummy reference speaker file or write placeholder
                 os.makedirs("static/samples", exist_ok=True)
                 with open(ref_speaker, "wb") as f:
                     f.write(b"")
@@ -63,7 +108,8 @@ class CoquiXTTSProvider(TextToSpeechProvider):
                 os.remove(temp_wav)
         except Exception as e:
             logger.error(f"Local Coqui XTTS synthesis failed: {e}")
-            yield b""
+            async for chunk in EdgeTTSProvider().stream_speech(text):
+                yield chunk
 
 class MockTTSProvider(TextToSpeechProvider):
     async def stream_speech(self, text: str) -> AsyncGenerator[bytes, None]:
@@ -74,7 +120,7 @@ class MockTTSProvider(TextToSpeechProvider):
 
 class VoiceService:
     def __init__(self) -> None:
-        self.provider: TextToSpeechProvider = CoquiXTTSProvider()
+        self.provider: TextToSpeechProvider = EdgeTTSProvider()
 
     async def stream_speech(self, text: str) -> AsyncGenerator[bytes, None]:
         async for chunk in self.provider.stream_speech(text):
