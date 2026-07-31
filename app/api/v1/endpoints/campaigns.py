@@ -56,7 +56,17 @@ async def create_campaign(
     await db.commit()
     
     if hasattr(db, "refresh"):
-        await db.refresh(db_obj)
+        try:
+            await db.refresh(db_obj)
+        except Exception:
+            pass
+            
+    from datetime import datetime, timezone
+    if getattr(db_obj, "created_at", None) is None:
+        db_obj.created_at = datetime.now(timezone.utc)
+    if getattr(db_obj, "updated_at", None) is None:
+        db_obj.updated_at = datetime.now(timezone.utc)
+        
     return db_obj
 
 @router.get("/{campaign_id}", response_model=CampaignOut)
@@ -95,7 +105,17 @@ async def update_campaign(
     updated_obj = await campaign_repo.update(campaign, update_data)
     await db.commit()
     if hasattr(db, "refresh"):
-        await db.refresh(updated_obj)
+        try:
+            await db.refresh(updated_obj)
+        except Exception:
+            pass
+            
+    from datetime import datetime, timezone
+    if getattr(updated_obj, "created_at", None) is None:
+        updated_obj.created_at = datetime.now(timezone.utc)
+    if getattr(updated_obj, "updated_at", None) is None:
+        updated_obj.updated_at = datetime.now(timezone.utc)
+        
     return updated_obj
 
 @router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)

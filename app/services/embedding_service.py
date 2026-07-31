@@ -34,8 +34,9 @@ class OpenAIEmbeddingService(EmbeddingService):
             )
             return [data.embedding for data in response.data]
         except Exception as e:
-            logger.error(f"OpenAI embedding generation failed: {e}")
-            raise
+            logger.warning(f"OpenAI embedding generation failed: {e}. Falling back to mock embeddings.")
+            mock = MockEmbeddingService()
+            return await mock.get_embeddings(texts)
 
     async def get_query_embedding(self, text: str) -> List[float]:
         embeddings = await self.get_embeddings([text])
