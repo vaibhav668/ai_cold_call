@@ -1,5 +1,8 @@
+from typing import Optional
+from app.core.config import settings
 from app.core.logging import logger
-
+from app.services.speech.vad.base import VoiceActivityDetector
+from app.services.speech.vad.silero_provider import SileroVADProvider
 
 def decode_ulaw_sample(u_val: int) -> int:
     """Decodes G.711 mu-law byte sample back to a 16-bit linear PCM signed integer."""
@@ -21,51 +24,31 @@ def _rms(audio_chunk: bytes) -> float:
     return (total / len(audio_chunk)) ** 0.5
 
 
-class EndOfSpeechDetector:
-    """
-    Stateful VAD with dynamic noise floor estimation and hysteresis.
-
-    Designed for real-world phone lines with varying noise/static levels.
-    """
+class LegacyRMSDetector(VoiceActivityDetector):
+    """Fallback VAD using dynamic noise floor estimation and energy thresholds."""
 
     def __init__(self) -> None:
         self._in_speech = False
         self._speech_frames = 0
         self._silence_frames = 0
         self._speech_confirmed = False
-
-        # Dynamic noise floor tracking (adapts to line hum/static)
         self.noise_floor = 150.0
 
-    def process_frame(self, audio_chunk: bytes) -> str | None:
-        """
-        Process one 20ms audio frame.
-
-        Returns:
-            'speech_start'  — customer confirmed speaking
-            'speech_end'    — customer finished utterance
-            None            — no event this frame
-        """
+    def process_frame(self, audio_chunk: bytes) -> Optional[str]:
         rms = _rms(audio_chunk)
 
-        # 1. Update dynamic noise floor
+        # Update dynamic noise floor
         if rms < self.noise_floor:
-            # Adapt quickly to lower energy levels (silence/drops)
             self.noise_floor = 0.95 * self.noise_floor + 0.05 * rms
         else:
-            # Adapt very slowly to higher background noise if not speaking
             if not self._in_speech:
                 self.noise_floor = 0.999 * self.noise_floor + 0.001 * rms
 
-        # Clamp noise floor to safe phone line limits (50 to 800 RMS)
         self.noise_floor = max(50.0, min(800.0, self.noise_floor))
 
-        # 2. Derive dynamic thresholds relative to current noise floor
-        # Minimum thresholds protect against random silence/clicks
         speech_threshold = max(380.0, self.noise_floor + 250.0)
         silence_threshold = max(200.0, self.noise_floor + 100.0)
 
-        # 3. State machine
         if not self._in_speech:
             if rms > speech_threshold:
                 self._speech_frames += 1
@@ -79,28 +62,22 @@ class EndOfSpeechDetector:
         else:
             if rms < silence_threshold:
                 self._silence_frames += 1
-                if self._silence_frames >= 20:  # ~400ms silence timeout
+                if self._silence_frames >= 20:
                     self._in_speech = False
                     self._speech_frames = 0
                     self._silence_frames = 0
                     self._speech_confirmed = False
                     return 'speech_end'
             else:
-                # Speech continued — reset silence counter
                 self._silence_frames = 0
 
         return None
 
     def reset(self) -> None:
-        """Reset state tracking (preserves noise floor history)."""
         self._in_speech = False
         self._speech_frames = 0
         self._silence_frames = 0
         self._speech_confirmed = False
-
-    @property
-    def is_speaking(self) -> bool:
-        return self._in_speech
 
     @property
     def speech_threshold(self) -> float:
@@ -111,8 +88,52 @@ class EndOfSpeechDetector:
         return max(200.0, self.noise_floor + 100.0)
 
 
+class EndOfSpeechDetector:
+    """
+    Facade class acting as the primary VAD service.
+    Encapsulates Silero VAD with local RMS fallback for high availability.
+    """
+
+    def __init__(self) -> None:
+        provider_name = settings.VAD_PROVIDER.lower()
+        self.provider: VoiceActivityDetector = None
+        self._fallback_provider = LegacyRMSDetector()
+
+        if provider_name == "silero":
+            self.provider = SileroVADProvider()
+            if self.provider.model is None:
+                logger.warning("[VAD] Silero load failed. Falling back to dynamic RMS VAD.")
+                self.provider = self._fallback_provider
+        else:
+            self.provider = self._fallback_provider
+
+    def process_frame(self, audio_chunk: bytes) -> Optional[str]:
+        return self.provider.process_frame(audio_chunk)
+
+    def reset(self) -> None:
+        self.provider.reset()
+
+    @property
+    def is_speaking(self) -> bool:
+        if isinstance(self.provider, SileroVADProvider):
+            return self.provider.is_speaking
+        return self._fallback_provider._in_speech
+
+    @property
+    def noise_floor(self) -> float:
+        return self._fallback_provider.noise_floor
+
+    @property
+    def speech_threshold(self) -> float:
+        return self._fallback_provider.speech_threshold
+
+    @property
+    def silence_threshold(self) -> float:
+        return self._fallback_provider.silence_threshold
+
+
 class VADService:
-    """Legacy single-frame is_speech check preserved for backward compatibility."""
+    """Legacy single-frame check kept for backwards compatibility."""
 
     def __init__(self, threshold: float = 380.0) -> None:
         self.threshold = threshold

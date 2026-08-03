@@ -1,7 +1,7 @@
 import uuid
 from typing import List, Dict, Any
 from app.db.chroma import chroma_manager
-from app.services.embedding_service import OpenAIEmbeddingService
+from app.services.embedding_service import EmbeddingService
 from app.core.logging import logger
 
 COLLECTION_NAME = "knowledge_base"
@@ -27,20 +27,43 @@ def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> Lis
     return chunks
 
 class RAGService:
+    """
+    RAG Service for document chunking, indexing, and retrieval.
+    Decoupled from specific embedding providers via the EmbeddingService facade.
+    """
+
     def __init__(self) -> None:
-        self.embedding_service = OpenAIEmbeddingService()
+        self.embedding_service = EmbeddingService()
 
     async def get_collection_name(self) -> str:
         return COLLECTION_NAME
 
     async def initialize_collection(self) -> None:
-        """Create ChromaDB collection if not already initialized."""
+        """Create ChromaDB collection if not already initialized. Verify dimensionality."""
         client = chroma_manager.get_client()
         try:
-            client.get_or_create_collection(name=COLLECTION_NAME)
+            collection = client.get_or_create_collection(name=COLLECTION_NAME)
+            
+            # Check for embedding dimensionality conflict (e.g. migrating 1536 -> 1024)
+            # Try a dummy query with the provider's native dimension size
+            dummy_vector = [0.0] * self.embedding_service.dimension
+            try:
+                collection.query(query_embeddings=[dummy_vector], n_results=1)
+            except Exception as dim_err:
+                err_str = str(dim_err).lower()
+                if "dimension" in err_str or "dimensionality" in err_str or "size" in err_str:
+                    logger.warning(
+                        f"[RAG] ChromaDB dimension mismatch: {dim_err}. "
+                        "Recreating collection to adapt to new embedding model..."
+                    )
+                    try:
+                        client.delete_collection(name=COLLECTION_NAME)
+                        client.get_or_create_collection(name=COLLECTION_NAME)
+                        logger.info("[RAG] ChromaDB collection recreated successfully with 1024-d.")
+                    except Exception as del_err:
+                        logger.error(f"[RAG] Failed to delete/recreate collection: {del_err}")
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB collection: {e}")
-            pass
 
     async def index_document(
         self,
@@ -77,7 +100,6 @@ class RAGService:
             documents.append(chunk)
             
         try:
-            # ChromaDB expects embeddings as float lists
             collection.add(
                 ids=ids,
                 embeddings=embeddings,
@@ -127,3 +149,13 @@ class RAGService:
         except Exception as e:
             logger.error(f"Failed to execute semantic search in ChromaDB: {e}")
             return []
+
+    async def delete_document_vectors(self, document_id: uuid.UUID) -> None:
+        """Purge vectors from ChromaDB for a specific document."""
+        client = chroma_manager.get_client()
+        try:
+            collection = client.get_or_create_collection(name=COLLECTION_NAME)
+            collection.delete(where={"document_id": str(document_id)})
+            logger.info(f"Purged ChromaDB vectors for document ID {document_id}")
+        except Exception as e:
+            logger.error(f"Failed to delete document vectors from ChromaDB: {e}")

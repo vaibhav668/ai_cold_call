@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     FALLBACK_LLM_PROVIDER: str = "openrouter"
     LLM_MODEL: str = "llama-3.1-8b-instant"
 
+    # Speech AI providers
+    STT_PROVIDER: str = "faster_whisper"
+    WHISPER_MODEL: str = "large-v3-turbo"
+    VAD_PROVIDER: str = "silero"
+    TTS_PROVIDER: str = "melotts"
+    EMBEDDING_PROVIDER: str = "bge_m3"
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
+
 
     # Security & Authentication
     JWT_SECRET_KEY: str = "supersecretdevelopmentkeychangeinproduction"

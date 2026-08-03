@@ -36,6 +36,41 @@ class MockDbSession:
                 return Scalars(self._data)
             def scalar_one(self):
                 return len(self._data)
+
+        import uuid
+        from app.models.call_log import CallLog
+        from app.models.prompt_template import PromptTemplate
+        from app.models.customer import Customer
+
+        stmt_str = str(statement).lower()
+        if "call_logs" in stmt_str:
+            mock_call = CallLog(
+                id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                campaign_id=uuid.UUID("8b68301f-3ac4-4043-9f15-c56d98df904e"),
+                customer_id=uuid.UUID("780a3d85-c788-46d6-a370-6602a6771bc6"),
+                plivo_call_uuid="test_plivo_call_uuid_vad",
+                status="ringing"
+            )
+            return Result([mock_call])
+        elif "prompt_templates" in stmt_str:
+            mock_temp = PromptTemplate(
+                id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
+                campaign_id=uuid.UUID("8b68301f-3ac4-4043-9f15-c56d98df904e"),
+                name="Mock Template",
+                system_prompt="Greeting",
+                is_active=True
+            )
+            return Result([mock_temp])
+        elif "customers" in stmt_str:
+            mock_cust = Customer(
+                id=uuid.UUID("780a3d85-c788-46d6-a370-6602a6771bc6"),
+                first_name="Akash",
+                last_name="Sharma",
+                phone_number="+1234567890",
+                is_active=True
+            )
+            return Result([mock_cust])
+
         return Result([])
 
     async def get(self, model, id):
@@ -98,10 +133,10 @@ def test_streaming_interruption_via_websocket(override_auth, monkeypatch):
     app.dependency_overrides[get_db_session] = mock_db
 
     # Mock dynamic STT chunking response to trigger transcription turn
-    from app.services.stt_service import MockSTTProvider
-    async def mock_transcribe(self, chunk):
+    from app.services.speech.stt.faster_whisper_provider import FasterWhisperProvider
+    async def mock_transcribe(self, audio_bytes, language=None):
         return "hello reschedule please"
-    monkeypatch.setattr(MockSTTProvider, "transcribe_chunk", mock_transcribe)
+    monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_transcribe)
 
     with client.websocket_connect(f"/api/v1/telephony/stream/{call_id}") as ws:
         # Start connection
@@ -129,4 +164,4 @@ def test_streaming_interruption_via_websocket(override_auth, monkeypatch):
             replies.append(data)
             
         assert len(replies) == 5
-        assert all(r["event"] == "media" for r in replies)
+        assert all(r["event"] == "playAudio" for r in replies)

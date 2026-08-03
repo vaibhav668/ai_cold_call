@@ -28,6 +28,13 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing external service connection pools...")
     chroma_manager.connect()
     
+    try:
+        from app.services.rag_service import RAGService
+        rag = RAGService()
+        await rag.initialize_collection()
+    except Exception as e:
+        logger.error(f"Failed to auto-initialize RAG collection: {e}")
+    
     yield
     
     # Shutdown hook: Clean up pools

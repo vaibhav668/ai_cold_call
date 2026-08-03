@@ -182,12 +182,12 @@ async def test_chroma_indexing_and_searching(monkeypatch):
     from app.services.rag_service import RAGService
     from app.db.chroma import chroma_manager
     from app.core.config import settings
-    from app.services.embedding_service import OpenAIEmbeddingService
+    from app.services.embeddings.bge_m3_provider import BGEM3EmbeddingProvider
     
-    # Mock embedding generator to prevent calling OpenAI API during tests
+    # Mock embedding generator to prevent loading model/calling API during tests
     async def mock_get_embeddings(self, texts):
-        return [[0.1] * 1536 for _ in texts]
-    monkeypatch.setattr(OpenAIEmbeddingService, "get_embeddings", mock_get_embeddings)
+        return [[0.1] * 1024 for _ in texts]
+    monkeypatch.setattr(BGEM3EmbeddingProvider, "get_embeddings", mock_get_embeddings)
     
     # Set in-memory path for ephemeral client
     monkeypatch.setattr(settings, "CHROMA_DB_PATH", ":memory:")

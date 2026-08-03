@@ -17,8 +17,15 @@ email-validator>=2.1.1
 openpyxl>=3.1.2
 pypdf>=4.0.0
 openai>=1.14.0
-edge-tts>=7.0.0
 miniaudio>=1.60.0
 
-
-
+# Speech AI subsystem requirements
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+silero-vad>=0.1.1
+melotts>=0.1.0
+transformers>=4.38.0
+sentence-transformers>=2.5.0
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy>=1.22.4

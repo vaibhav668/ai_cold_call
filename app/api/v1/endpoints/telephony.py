@@ -160,7 +160,12 @@ async def plivo_status_webhook(
 
 async def _resolve_call_context(call_uuid: str) -> tuple[Optional[uuid.UUID], Optional[uuid.UUID]]:
     """Resolves campaign_id and customer_id with multi-tier database fallback."""
-    async for db in get_db_session():
+    # Respect FastAPI dependency overrides for testing
+    from app.main import app
+    from app.db.session import get_db_session
+    session_generator = app.dependency_overrides.get(get_db_session, get_db_session)
+
+    async for db in session_generator():
         # Tier 1: Exact match
         query = select(CallLog).where(CallLog.plivo_call_uuid == call_uuid)
         result = await db.execute(query)
