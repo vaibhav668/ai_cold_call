@@ -299,6 +299,17 @@ class ConversationEngine:
         elif not exchanges:
             status_val = "failed"
             
+        existing_log = await self.call_log_repo.get_by_plivo_uuid(call_id)
+        if existing_log:
+            updated_log = await self.call_log_repo.update(existing_log, {
+                "status": status_val,
+                "duration_seconds": duration_seconds,
+                "transcript": exchanges
+            })
+            await self.db.commit()
+            await self.session_manager.clear_session(call_id)
+            return updated_log
+            
         call_log = CallLog(
             campaign_id=campaign_id,
             customer_id=customer_id,
