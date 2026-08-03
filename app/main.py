@@ -35,28 +35,35 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to auto-initialize RAG collection: {e}")
         
-    # Pre-load heavy Speech AI models to prevent first-call latency spikes and silence timeouts
-    logger.info("Pre-loading Speech AI models (CTranslate2 Whisper, MeloTTS)...")
+    # Pre-load heavy Speech AI models in the background to prevent startup timeouts and memory spikes
     try:
         import asyncio
         from app.services.speech.tts.melotts_provider import MeloTTSProvider
         from app.services.speech.stt.faster_whisper_provider import FasterWhisperProvider
         import os
-        
-        async def load_tts():
-            logger.info("Pre-loading MeloTTS model...")
-            await MeloTTSProvider._get_model_and_speaker()
-            
-        async def load_stt():
-            logger.info("Pre-loading CTranslate2 Whisper model...")
-            model_size = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
-            await FasterWhisperProvider._get_model(model_size)
 
-        # Run model loads in parallel
-        await asyncio.gather(load_tts(), load_stt())
-        logger.info("All Speech AI models pre-loaded successfully.")
+        async def load_models_sequentially():
+            # Wait 5 seconds after startup to ensure web server is fully responsive and listening
+            await asyncio.sleep(5.0)
+            
+            try:
+                logger.info("Pre-loading MeloTTS model in the background...")
+                await MeloTTSProvider._get_model_and_speaker()
+                logger.info("MeloTTS model pre-loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to pre-load MeloTTS: {e}")
+                
+            try:
+                logger.info("Pre-loading CTranslate2 Whisper model in the background...")
+                model_size = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+                await FasterWhisperProvider._get_model(model_size)
+                logger.info("CTranslate2 Whisper model pre-loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to pre-load CTranslate2 Whisper: {e}")
+
+        asyncio.create_task(load_models_sequentially())
     except Exception as e:
-        logger.error(f"Failed to pre-load Speech AI models: {e}")
+        logger.error(f"Failed to register background Speech AI models preloading: {e}")
     
     yield
     
