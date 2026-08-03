@@ -310,6 +310,10 @@ async def _send_loop(
                 logger.warning(f"[SEND] WebSocket send failed: {e}")
                 break
 
+            # Pacing: Sleep for 20ms between sending each 20ms G.711 mu-law (160 bytes) chunk.
+            # This prevents packet bursting and matches Plivo's real-time VoIP buffer playback rate.
+            await asyncio.sleep(0.02)
+
     except asyncio.CancelledError:
         pass
     except Exception as e:
