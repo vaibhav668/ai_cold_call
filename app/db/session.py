@@ -246,7 +246,9 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
         except Exception as e:
-            logger.error(f"Database session error occurred: {e}")
+            from fastapi import HTTPException
+            if not isinstance(e, HTTPException):
+                logger.error(f"Database session error occurred: {e}")
             await session.rollback()
             raise
         finally:
