@@ -15,6 +15,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-deps git+https://github.com/myshell-ai/MeloTTS.git
 
 # Stage 2: Final run stage
 FROM python:3.11-slim AS final

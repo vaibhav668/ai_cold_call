@@ -23,7 +23,15 @@ miniaudio>=1.60.0
 faster-whisper>=1.0.0
 ctranslate2>=4.0.0
 silero-vad>=0.1.1
-melotts @ git+https://github.com/myshell-ai/MeloTTS.git
+librosa
+soundfile
+scipy
+cached_path
+txtsplit
+anyascii
+sacremoses
+phonemizer
+num2words
 transformers>=4.38.0
 sentence-transformers>=2.5.0
 torch>=2.2.0
