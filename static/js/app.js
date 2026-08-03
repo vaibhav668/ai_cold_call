@@ -442,7 +442,11 @@ async function triggerDialCampaign(campaignId) {
             return;
         }
         
-        const customer = customers[0];
+        let customer = customers[0];
+        const vaibhavCust = customers.find(c => c.phone_number === "+918266894170" || c.first_name === "Vaibhav");
+        if (vaibhavCust) {
+            customer = vaibhavCust;
+        }
         
         // Trigger dialing API
         const response = await apiFetch('/telephony/dial', {
