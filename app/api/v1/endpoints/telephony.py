@@ -60,6 +60,30 @@ _STOP_SENTINEL = b"__STOP__"
 # REST endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+@router.get("/telephony/logs")
+async def list_call_logs(
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user)
+):
+    """Retrieve call logs with pagination."""
+    query = select(CallLog).order_by(CallLog.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    call_logs = result.scalars().all()
+    
+    return [{
+        "id": str(log.id),
+        "campaign_id": str(log.campaign_id) if log.campaign_id else None,
+        "customer_id": str(log.customer_id) if log.customer_id else None,
+        "plivo_call_uuid": log.plivo_call_uuid,
+        "phone_number": log.phone_number,
+        "status": log.status,
+        "duration_seconds": log.duration_seconds,
+        "transcript": log.transcript,
+        "created_at": log.created_at.isoformat() if log.created_at else None
+    } for log in call_logs]
+
 @router.post("/telephony/dial", response_model=CallTriggerOut)
 async def trigger_outbound_call(
     payload: CallTriggerIn,

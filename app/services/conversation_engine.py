@@ -61,6 +61,32 @@ class ConversationEngine:
                         "required": ["query"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "confirm_appointment",
+                    "description": "Confirm the customer is attending the scheduled appointment.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "reschedule_appointment",
+                    "description": "Trigger the rescheduling workflow when a customer explicitly requests a change.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "new_date": {"type": "string", "description": "Proposed new date (YYYY-MM-DD)"},
+                            "new_time": {"type": "string", "description": "Proposed new time (HH:MM)"}
+                        },
+                        "required": ["new_date", "new_time"]
+                    }
+                }
             }
         ]
 
@@ -182,6 +208,16 @@ class ConversationEngine:
                     facts = await self.rag_service.search_knowledge(campaign_id, query, limit=2)
                     facts_list = [f["text"] for f in facts]
                     tool_result_content = json.dumps({"facts": facts_list})
+
+                elif func_name == "confirm_appointment":
+                    state = "appointment_confirmed"
+                    await self.session_manager.update_session_state(call_id, state)
+                    tool_result_content = "Appointment successfully confirmed in the database."
+
+                elif func_name == "reschedule_appointment":
+                    state = "appointment_rescheduled"
+                    await self.session_manager.update_session_state(call_id, state)
+                    tool_result_content = f"Appointment rescheduled successfully for {args.get('new_date')} at {args.get('new_time')}."
 
                 else:
                     tool_result_content = f"Error: Tool '{func_name}' not implemented."

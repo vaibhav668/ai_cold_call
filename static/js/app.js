@@ -1,6 +1,15 @@
 // Platform Frontend State Manager
 const API_BASE = '/api/v1';
 
+// Defensive array extraction utility
+function getArrayData(data) {
+    if (!data) return [];
+    if (Array.isArray(data)) return data;
+    if (data.items && Array.isArray(data.items)) return data.items;
+    if (data.data && Array.isArray(data.data)) return data.data;
+    return [];
+}
+
 // API Fetch wrapper adding token authentication headers
 async function apiFetch(endpoint, options = {}) {
     const token = localStorage.getItem('token');
@@ -145,12 +154,13 @@ async function loadCampaigns() {
         const docSelect = document.getElementById('upload-doc-campaign');
         docSelect.innerHTML = '<option value="">Select Target Campaign...</option>';
         
-        if (!data.items || data.items.length === 0) {
+        const campaigns = getArrayData(data);
+        if (campaigns.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No outbound campaigns created yet.</td></tr>';
             return;
         }
         
-        data.items.forEach(c => {
+        campaigns.forEach(c => {
             // Append target select option
             const opt = document.createElement('option');
             opt.value = c.id;
@@ -237,12 +247,13 @@ async function loadCustomers() {
         const tbody = document.getElementById('customers-tbody');
         tbody.innerHTML = '';
         
-        if (data.length === 0) {
+        const customers = getArrayData(data);
+        if (customers.length === 0) {
             tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No customer contacts imported.</td></tr>';
             return;
         }
         
-        data.forEach(c => {
+        customers.forEach(c => {
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td style="font-weight: 600;">${c.first_name} ${c.last_name || ''}</td>
@@ -307,12 +318,13 @@ async function loadKnowledge() {
         if (!response.ok) return;
         
         const data = await response.json();
-        if (data.length === 0) {
+        const docs = getArrayData(data);
+        if (docs.length === 0) {
             tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No documents indexed for this campaign.</td></tr>';
             return;
         }
         
-        data.forEach(d => {
+        docs.forEach(d => {
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td style="font-weight: 600;">${d.filename}</td>
@@ -378,10 +390,42 @@ async function deleteDocument(id) {
 
 // 5. Call History Logs list
 async function loadCallLogs() {
-    // Note: Since CallLogs list requires backend, we can simulate loading logs.
-    // If campaign details / dial outputs has been done, logs populate.
-    const tbody = document.getElementById('logs-tbody');
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No complete call transcripts found. Start calls to view logs.</td></tr>';
+    try {
+        const response = await apiFetch('/telephony/logs');
+        if (!response.ok) return;
+        
+        const data = await response.json();
+        const tbody = document.getElementById('logs-tbody');
+        tbody.innerHTML = '';
+        
+        const logs = getArrayData(data);
+        if (logs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">No complete call transcripts found. Start calls to view logs.</td></tr>';
+            return;
+        }
+        
+        // Map logs globally for dynamic viewing
+        window._loadedLogs = window._loadedLogs || {};
+        
+        logs.forEach(log => {
+            window._loadedLogs[log.plivo_call_uuid] = log;
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td style="font-size: 0.8rem; font-family: monospace;">${log.plivo_call_uuid || log.id}</td>
+                <td>${log.phone_number}</td>
+                <td><span class="badge badge-active">${log.status}</span></td>
+                <td>${log.duration_seconds || 0}s</td>
+                <td>
+                    <button class="btn btn-primary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="viewCallTranscript('${log.plivo_call_uuid}')">
+                        <i class="fa-solid fa-align-left"></i> Review Transcript
+                      </button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+    } catch (err) {
+        console.error(err);
+    }
 }
 
 // Trigger outbound call trigger
@@ -390,9 +434,10 @@ async function triggerDialCampaign(campaignId) {
     try {
         const custResp = await apiFetch('/customers/');
         if (!custResp.ok) return;
-        const customers = await custResp.json();
+        const data = await custResp.json();
+        const customers = getArrayData(data);
         
-        if (customers.length === 0) {
+        if (!customers || customers.length === 0) {
             alert('Please import customer contacts first in the Customers tab.');
             return;
         }
@@ -459,6 +504,7 @@ async function triggerDialCampaign(campaignId) {
                         })
                     }).then(() => {
                         alert('Voice call completed. Transcript saved to PostgreSQL call log.');
+                        loadCallLogs(); // Refresh logs tab
                     });
                 }
             }, 2000);
@@ -472,14 +518,35 @@ async function triggerDialCampaign(campaignId) {
     }
 }
 
+// Real Transcript modal display
+function viewCallTranscript(plivoCallUuid) {
+    const log = window._loadedLogs ? window._loadedLogs[plivoCallUuid] : null;
+    const viewer = document.getElementById('transcript-viewer-box');
+    viewer.innerHTML = '';
+    
+    if (!log || !log.transcript || log.transcript.length === 0) {
+        viewer.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 2rem;">No conversational text exchanges logged for this call.</div>';
+    } else {
+        log.transcript.forEach(ex => {
+            const isAgent = (ex.sender === 'agent');
+            const div = document.createElement('div');
+            div.className = `chat-bubble ${isAgent ? 'agent' : 'customer'}`;
+            div.style.marginTop = '10px';
+            div.innerText = `${isAgent ? 'AI Coordinator' : 'Customer'}: ${ex.text}`;
+            viewer.appendChild(div);
+        });
+    }
+    openModal('transcript-modal');
+}
+
 // Live Mock Transcript modal display
 function viewLiveMockTranscript(id) {
     const viewer = document.getElementById('transcript-viewer-box');
     viewer.innerHTML = `
         <div class="chat-bubble customer">Hello, who is this?</div>
-        <div class="chat-bubble agent" style="margin-top: 10px;">Hello! I am James from Premium Realty. I wanted to tell you about our new hospital list...</div>
+        <div class="chat-bubble agent" style="margin-top: 10px;">Hello! I am James from Premium Realty. I wanted to tell you about our new listing...</div>
         <div class="chat-bubble customer" style="margin-top: 10px;">Great, can I book an appointment?</div>
-        <div class="chat-bubble agent" style="margin-top: 10px;">Sure! Let me schedule that appointment details...</div>
+        <div class="chat-bubble agent" style="margin-top: 10px;">Sure! Let me schedule that showing details...</div>
     `;
     openModal('transcript-modal');
 }
