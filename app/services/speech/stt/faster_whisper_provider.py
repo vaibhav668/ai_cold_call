@@ -38,7 +38,7 @@ class FasterWhisperProvider(SpeechToTextProvider):
     _model_lock = asyncio.Lock()
 
     def __init__(self) -> None:
-        self.model_size = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+        self.model_size = os.environ.get("WHISPER_MODEL", "base")
         self.api_key = os.environ.get("GROQ_API_KEY", "")
 
     @classmethod

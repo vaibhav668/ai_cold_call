@@ -75,6 +75,10 @@ async def lifespan(app: FastAPI):
         import os
 
         async def load_models_sequentially():
+            if os.environ.get("PRELOAD_MODELS", "false").lower() != "true":
+                logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true). Skipping to prevent startup timeouts.")
+                return
+
             # Wait 5 seconds after startup to ensure web server is fully responsive and listening
             await asyncio.sleep(5.0)
             
@@ -87,7 +91,7 @@ async def lifespan(app: FastAPI):
                 
             try:
                 logger.info("Pre-loading CTranslate2 Whisper model in the background...")
-                model_size = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+                model_size = os.environ.get("WHISPER_MODEL", "base")
                 await FasterWhisperProvider._get_model(model_size)
                 logger.info("CTranslate2 Whisper model pre-loaded successfully.")
             except Exception as e:
