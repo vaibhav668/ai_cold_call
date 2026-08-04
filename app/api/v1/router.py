@@ -14,6 +14,7 @@ from app.api.v1.endpoints.prompts import router as prompts_router
 from app.api.v1.endpoints.conversation import router as conversation_router
 from app.api.v1.endpoints.telephony import router as telephony_router
 from app.api.v1.endpoints.analytics import router as analytics_router
+from app.voice_demo.controllers.voice_agent import router as voice_demo_router
 
 router = APIRouter()
 
@@ -26,6 +27,7 @@ router.include_router(prompts_router, tags=["Prompt Management"])
 router.include_router(conversation_router, tags=["Conversation Engine"])
 router.include_router(telephony_router, tags=["Telephony"])
 router.include_router(analytics_router, tags=["Analytics"])
+router.include_router(voice_demo_router, prefix="/voice-demo", tags=["Voice Demo"])
 
 @router.get("/health", status_code=status.HTTP_200_OK)
 async def health_check(db: AsyncSession = Depends(get_db_session)):

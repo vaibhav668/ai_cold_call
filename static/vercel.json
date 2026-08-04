@@ -4,6 +4,10 @@
     {
       "source": "/api/v1/:path*",
       "destination": "https://ai-cold-call.onrender.com/api/v1/:path*"
+    },
+    {
+      "source": "/voice-agent",
+      "destination": "/voice-agent.html"
     }
   ]
 }

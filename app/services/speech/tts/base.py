@@ -10,7 +10,8 @@ class TextToSpeechProvider(ABC):
         self,
         text: str,
         cancel_event: Optional[asyncio.Event] = None,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        voice_config: Optional[dict] = None
     ) -> AsyncGenerator[bytes, None]:
         """
         Synthesize text into speech and yield G.711 mu-law 20ms chunks.

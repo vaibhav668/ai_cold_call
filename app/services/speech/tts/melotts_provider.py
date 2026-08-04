@@ -124,24 +124,34 @@ class MeloTTSProvider(TextToSpeechProvider):
         self,
         text: str,
         cancel_event: Optional[asyncio.Event] = None,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        voice_config: Optional[dict] = None
     ) -> AsyncGenerator[bytes, None]:
         # Phoneticize Indic languages so English VITS model can speak them natively
         processed_text = transliterate_text(text)
         logger.info(f"[TTS] Synthesizing: '{processed_text[:60]}...' (original: '{text[:60]}...')")
 
         # 1. Try local MeloTTS model
-        model, speaker_id = await self._get_model_and_speaker()
+        model, default_speaker_id = await self._get_model_and_speaker()
         if model != "FAILED" and model is not None:
             try:
                 import miniaudio
+                # Determine speaker id from voice_config
+                speaker_id = default_speaker_id
+                speed = 1.0
+                if voice_config:
+                    spk_name = voice_config.get("speaker_id")
+                    if spk_name and hasattr(model, "hps") and hasattr(model.hps, "data") and hasattr(model.hps.data, "spk2id"):
+                        speaker_id = model.hps.data.spk2id.get(spk_name, default_speaker_id)
+                    speed = voice_config.get("speed", 1.0)
+
                 # Create temporary file to store MeloTTS output wav
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
                     tmp_path = tmpfile.name
 
                 try:
                     def generate():
-                        model.tts_to_file(processed_text, speaker_id, tmp_path, speed=1.0)
+                        model.tts_to_file(processed_text, speaker_id, tmp_path, speed=speed)
                     
                     # Run synthesis in executor
                     await asyncio.get_event_loop().run_in_executor(None, generate)

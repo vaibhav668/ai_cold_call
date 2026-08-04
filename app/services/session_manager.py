@@ -4,6 +4,7 @@ from app.core.logging import logger
 
 _in_memory_states: Dict[str, str] = {}
 _in_memory_messages: Dict[str, List[Dict[str, str]]] = {}
+_in_memory_metadata: Dict[str, Dict] = {}
 
 class SessionManager:
     def __init__(self) -> None:
@@ -16,6 +17,16 @@ class SessionManager:
     async def update_session_state(self, call_id: str, state: str) -> None:
         """Set call current state in local Python in-memory storage."""
         _in_memory_states[call_id] = state
+
+    async def get_session_metadata(self, call_id: str) -> Optional[Dict]:
+        """Fetch custom session metadata from local Python in-memory storage."""
+        return _in_memory_metadata.get(call_id)
+
+    async def update_session_metadata(self, call_id: str, metadata: Dict) -> None:
+        """Set custom session metadata in local Python in-memory storage."""
+        if call_id not in _in_memory_metadata:
+            _in_memory_metadata[call_id] = {}
+        _in_memory_metadata[call_id].update(metadata)
 
     async def get_message_history(self, call_id: str) -> List[Dict[str, str]]:
         """Fetch list of message dictionary exchanges from local Python in-memory storage."""
@@ -31,3 +42,4 @@ class SessionManager:
         """Remove call configuration records and purge local memory session cache."""
         _in_memory_states.pop(call_id, None)
         _in_memory_messages.pop(call_id, None)
+        _in_memory_metadata.pop(call_id, None)

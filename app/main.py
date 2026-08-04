@@ -114,6 +114,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Include Router
 app.include_router(api_v1_router, prefix="/api/v1")
 
+# Serve Voice Agent Demo Page
+@app.get("/voice-agent")
+async def voice_agent_page():
+    from fastapi.responses import FileResponse
+    return FileResponse("static/voice-agent.html")
+
 # Mount Static Files Dashboard
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

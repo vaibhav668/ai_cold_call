@@ -9,6 +9,7 @@ from app.models.import_history import ImportHistory
 from app.models.campaign_lead import CampaignLead
 from app.models.document import Document
 from app.models.prompt_template import PromptTemplate
+from app.voice_demo.models.voice_profile import VoiceProfile
 
 __all__ = [
     "Base",
@@ -21,4 +22,5 @@ __all__ = [
     "CampaignLead",
     "Document",
     "PromptTemplate",
+    "VoiceProfile",
 ]

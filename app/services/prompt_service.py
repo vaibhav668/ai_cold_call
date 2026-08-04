@@ -7,7 +7,7 @@ from app.repositories.customer import CustomerRepository
 from app.services.rag_service import RAGService
 from app.core.exceptions import NotFoundException
 
-class PromptService:
+class PromptService: 
     def __init__(self, db: AsyncSession):
         self.db = db
         self.template_repo = PromptTemplateRepository(db)

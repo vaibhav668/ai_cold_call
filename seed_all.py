@@ -336,8 +336,104 @@ async def main():
             else:
                 await seed_documents(session, campaign.id, REAL_ESTATE_DOCS)
                 
+        # Step 5: Seed voice profiles
+        await seed_voice_profiles(session)
+
         await session.commit()
         print("Platform Seeding Completed Successfully!")
+
+VOICE_PROFILES = [
+    {
+        "name": "Sophia",
+        "description": "Professional Female",
+        "avatar": "/static/images/avatars/sophia.png",
+        "gender": "Female",
+        "supported_languages": "English,Hindi,Telugu",
+        "voice_provider": "melotts",
+        "voice_configuration": '{"speaker_id": "EN_INDIA", "speed": 1.0}',
+        "preview_audio": "/static/audio/previews/sophia.mp3",
+        "status": "active"
+    },
+    {
+        "name": "Maya",
+        "description": "Friendly Female",
+        "avatar": "/static/images/avatars/maya.png",
+        "gender": "Female",
+        "supported_languages": "English,Hindi",
+        "voice_provider": "melotts",
+        "voice_configuration": '{"speaker_id": "EN_US", "speed": 1.0}',
+        "preview_audio": "/static/audio/previews/maya.mp3",
+        "status": "active"
+    },
+    {
+        "name": "Ananya",
+        "description": "Customer Support Female",
+        "avatar": "/static/images/avatars/ananya.png",
+        "gender": "Female",
+        "supported_languages": "English,Telugu",
+        "voice_provider": "melotts",
+        "voice_configuration": '{"speaker_id": "EN_INDIA", "speed": 1.05}',
+        "preview_audio": "/static/audio/previews/ananya.mp3",
+        "status": "active"
+    },
+    {
+        "name": "Arjun",
+        "description": "Professional Male",
+        "avatar": "/static/images/avatars/arjun.png",
+        "gender": "Male",
+        "supported_languages": "English,Hindi,Telugu",
+        "voice_provider": "melotts",
+        "voice_configuration": '{"speaker_id": "EN_INDIA", "speed": 1.0}',
+        "preview_audio": "/static/audio/previews/arjun.mp3",
+        "status": "active"
+    },
+    {
+        "name": "David",
+        "description": "Sales Consultant Male",
+        "avatar": "/static/images/avatars/david.png",
+        "gender": "Male",
+        "supported_languages": "English",
+        "voice_provider": "melotts",
+        "voice_configuration": '{"speaker_id": "EN_US", "speed": 1.0}',
+        "preview_audio": "/static/audio/previews/david.mp3",
+        "status": "active"
+    }
+]
+
+async def seed_voice_profiles(session):
+    from app.voice_demo.models.voice_profile import VoiceProfile
+    from sqlalchemy import select
+
+    print("Seeding voice profiles...")
+    for vdata in VOICE_PROFILES:
+        q = select(VoiceProfile).where(VoiceProfile.name == vdata["name"])
+        res = await session.execute(q)
+        vp = res.scalars().first()
+        if not vp:
+            vp = VoiceProfile(
+                name=vdata["name"],
+                description=vdata["description"],
+                avatar=vdata["avatar"],
+                gender=vdata["gender"],
+                supported_languages=vdata["supported_languages"],
+                voice_provider=vdata["voice_provider"],
+                voice_configuration=vdata["voice_configuration"],
+                preview_audio=vdata["preview_audio"],
+                status=vdata["status"]
+            )
+            session.add(vp)
+            print(f"Created Voice Profile: {vp.name}")
+        else:
+            vp.description = vdata["description"]
+            vp.avatar = vdata["avatar"]
+            vp.gender = vdata["gender"]
+            vp.supported_languages = vdata["supported_languages"]
+            vp.voice_provider = vdata["voice_provider"]
+            vp.voice_configuration = vdata["voice_configuration"]
+            vp.preview_audio = vdata["preview_audio"]
+            vp.status = vdata["status"]
+            session.add(vp)
+            print(f"Updated Voice Profile: {vp.name}")
 
 if __name__ == "__main__":
     asyncio.run(main())

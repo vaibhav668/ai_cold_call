@@ -109,6 +109,22 @@ class ConversationEngine:
                 customer_id=customer_id,
                 rag_query=user_text
             )
+            # Add dynamic language constraints based on session metadata
+            metadata = await self.session_manager.get_session_metadata(call_id)
+            if metadata and "language" in metadata:
+                lang = metadata["language"]
+                if lang == "Hindi":
+                    compiled_prompt += (
+                        "\n\n### LANGUAGE GUIDELINE\n"
+                        "IMPORTANT: Speak only in Hindi. Translate all concepts, questions, and responses to Hindi naturally. "
+                        "Do NOT use English or Roman script. Use Devanagari script for output."
+                    )
+                elif lang == "Telugu":
+                    compiled_prompt += (
+                        "\n\n### LANGUAGE GUIDELINE\n"
+                        "IMPORTANT: Speak only in Telugu. Translate all concepts, questions, and responses to Telugu naturally. "
+                        "Do NOT use English or Roman script. Use Telugu script for output."
+                    )
             history.append({"role": "system", "content": compiled_prompt})
             await self.session_manager.append_message(call_id, history[-1])
             

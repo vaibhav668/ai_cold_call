@@ -21,8 +21,15 @@ class VoiceService:
         self,
         text: str,
         cancel_event: Optional[asyncio.Event] = None,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        voice_config: Optional[dict] = None
     ) -> AsyncGenerator[bytes, None]:
         """Synthesize text into G.711 mu-law audio chunks using the configured TTS provider."""
-        async for chunk in self.provider.stream_speech(text, cancel_event=cancel_event, language=language):
-            yield chunk
+        import inspect
+        sig = inspect.signature(self.provider.stream_speech)
+        if "voice_config" in sig.parameters:
+            async for chunk in self.provider.stream_speech(text, cancel_event=cancel_event, language=language, voice_config=voice_config):
+                yield chunk
+        else:
+            async for chunk in self.provider.stream_speech(text, cancel_event=cancel_event, language=language):
+                yield chunk
