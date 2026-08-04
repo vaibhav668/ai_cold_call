@@ -108,6 +108,13 @@ class MeloTTSProvider(TextToSpeechProvider):
                 
                 # Load inside executor to prevent event loop blocking
                 def load():
+                    # Ensure MeloTTS caches downloads to a writable directory.
+                    # MeloTTS uses XDG_CACHE_HOME / cached-path internally.
+                    cache_dir = os.environ.get("XDG_CACHE_HOME", "/tmp/xdg_cache")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+                    os.environ.setdefault("HF_HOME", os.environ.get("HF_HOME", "/tmp/hf_cache"))
+
                     model = TTS(language='EN', device='auto')
                     # Use Indian English accent for natural multilingual Indic voice
                     spk_id = model.hps.data.spk2id.get('EN_INDIA', 0)

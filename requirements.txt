@@ -18,6 +18,7 @@ openpyxl>=3.1.2
 pypdf>=4.0.0
 openai>=1.14.0
 miniaudio>=1.60.0
+cn2an  # Required by MeloTTS text normalization pipeline
 
 # Speech AI subsystem requirements
 faster-whisper>=1.0.0

@@ -56,11 +56,16 @@ class FasterWhisperProvider(SpeechToTextProvider):
                 logger.info(f"[STT] Initializing Faster-Whisper model '{model_size}' on CPU...")
                 # Run the blocking model loading inside executor to keep event loop responsive
                 def load_model():
+                    # Explicitly set download_root to /tmp to ensure write access on all
+                    # containerized platforms (Render, Railway, etc.) regardless of HOME dir.
+                    cache_dir = os.environ.get("HF_HOME", "/tmp/hf_cache")
+                    os.makedirs(cache_dir, exist_ok=True)
                     return WhisperModel(
                         model_size,
                         device="cpu",
                         compute_type="int8",
-                        cpu_threads=4
+                        cpu_threads=4,
+                        download_root=cache_dir
                     )
                 cls._model_instance = await asyncio.get_event_loop().run_in_executor(None, load_model)
                 logger.info(f"[STT] Faster-Whisper model '{model_size}' successfully loaded.")

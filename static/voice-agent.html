@@ -4,14 +4,20 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Voice Agent Demo | Enterprise Voice Platform</title>
+    <meta name="description" content="Experience real-time AI voice conversations directly in your browser. No phone number required.">
+
     <!-- Premium Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+
     <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
     <!-- Main Style Sheet -->
     <link rel="stylesheet" href="/static/css/voice-agent.css">
 </head>
-<body class="dark-theme">
+<body>
     <!-- Background Gradients -->
     <div class="bg-glow bg-glow-1"></div>
     <div class="bg-glow bg-glow-2"></div>
@@ -30,20 +36,21 @@
         <!-- Sidebar Panel (Controls) -->
         <section class="control-panel glass-panel">
             <div class="panel-section">
-                <h2>1. Configure Agent</h2>
-                <p class="section-desc">Customize the voice demo settings before starting your conversation.</p>
-                
+                <h2>Configure Agent</h2>
+                <p class="section-desc">Customize your voice demo before starting.</p>
+
                 <!-- Industry Selector -->
                 <div class="form-group">
-                    <label for="industry-select"><i class="fa-solid fa-building"></i> Select Industry</label>
+                    <label for="industry-select"><i class="fa-solid fa-building"></i> Industry</label>
                     <select id="industry-select" class="custom-select">
-                        <!-- Loaded dynamically -->
+                        <option value="hospital">Hospital Receptionist</option>
+                        <option value="real_estate">Real Estate Consultant</option>
                     </select>
                 </div>
 
                 <!-- Language Selector -->
                 <div class="form-group">
-                    <label for="language-select"><i class="fa-solid fa-language"></i> Select Language</label>
+                    <label for="language-select"><i class="fa-solid fa-language"></i> Language</label>
                     <select id="language-select" class="custom-select">
                         <option value="English">English</option>
                         <option value="Hindi">Hindi</option>
@@ -52,14 +59,15 @@
                 </div>
             </div>
 
+            <!-- Active Voice Display -->
             <div class="panel-section selected-voice-details">
                 <h3>Active Voice Profile</h3>
                 <div class="voice-details-card">
-                    <img id="active-voice-avatar" src="/static/images/avatars/placeholder.png" alt="Avatar" class="active-avatar">
+                    <div id="active-voice-avatar-wrap" class="avatar-wrap active-avatar-wrap"></div>
                     <div class="voice-info">
-                        <h4 id="active-voice-name">Sophia</h4>
-                        <span id="active-voice-role" class="badge">Professional Female</span>
-                        <p id="active-voice-desc">Warm, empathetic tone for patient communications.</p>
+                        <h4 id="active-voice-name">Select a Voice</h4>
+                        <span id="active-voice-role" class="badge">—</span>
+                        <p id="active-voice-desc">Click a voice in the circle to select it.</p>
                     </div>
                 </div>
             </div>
@@ -72,17 +80,18 @@
                 <button id="end-btn" class="btn btn-danger hidden">
                     <i class="fa-solid fa-phone-slash"></i> End Conversation
                 </button>
+
                 <div class="call-metrics hidden" id="call-metrics">
                     <div class="metric">
                         <span class="metric-label">Status</span>
-                        <span class="metric-value connection-status" id="connection-status">Connecting...</span>
+                        <span class="metric-value" id="connection-status">Connecting...</span>
                     </div>
                     <div class="metric">
                         <span class="metric-label">Duration</span>
                         <span class="metric-value" id="call-timer">00:00</span>
                     </div>
                     <div class="metric">
-                        <button id="mute-btn" class="btn-icon" title="Mute Microphone">
+                        <button id="mute-btn" class="btn-icon" title="Toggle Mute">
                             <i class="fa-solid fa-microphone"></i>
                         </button>
                         <span class="metric-label" id="mic-status">Active</span>
@@ -91,10 +100,9 @@
             </div>
         </section>
 
-        <!-- Central Arena (Reactive Orb & Circular Voices Selector) -->
+        <!-- Central Arena (Reactive Orb + Voice Circle) -->
         <section class="arena-panel">
             <div class="circular-arena" id="circular-arena">
-                <!-- Center Animated Orb -->
                 <div class="central-orb-container">
                     <div class="orb-pulsar state-idle" id="ai-orb">
                         <div class="orb-core"></div>
@@ -105,58 +113,57 @@
                     <div class="orb-status-text" id="orb-status-text">Choose a Voice</div>
                 </div>
 
-                <!-- Selectable Voice Avatars Placed in Circle via JS -->
-                <div class="circular-voice-nodes" id="voice-nodes-container">
-                    <!-- Loaded dynamically -->
-                </div>
+                <!-- Voice nodes placed via JS -->
+                <div class="circular-voice-nodes" id="voice-nodes-container"></div>
             </div>
         </section>
 
-        <!-- Live Transcript & Analytics Summary Panel -->
+        <!-- Live Transcript + Analytics Panel -->
         <section class="transcript-panel glass-panel">
             <div class="panel-tabs">
                 <button class="tab-btn active" id="tab-transcript-btn">Live Transcript</button>
                 <button class="tab-btn" id="tab-summary-btn" disabled>Call Summary</button>
             </div>
 
-            <!-- Live Transcript Content -->
+            <!-- Transcript Tab -->
             <div class="tab-content" id="transcript-tab-content">
                 <div class="transcript-scroll" id="transcript-scroll">
-                    <div class="empty-transcript-message" id="empty-transcript-msg">
-                        <i class="fa-solid fa-comments"></i>
-                        <p>No conversation active. Click "Start Conversation" to begin chatting with the AI voice agent.</p>
-                    </div>
-                    <!-- Messages appended here -->
+                    <!-- Messages appended here dynamically -->
+                </div>
+                <div class="empty-transcript-message" id="empty-transcript-msg">
+                    <i class="fa-solid fa-comments"></i>
+                    <p>No conversation yet. Start a session to chat with the AI voice agent.</p>
                 </div>
                 <div class="typing-indicator-container hidden" id="typing-indicator">
                     <span class="typing-label">AI is thinking</span>
                     <div class="dots">
-                        <span></span>
-                        <span></span>
-                        <span></span>
+                        <span></span><span></span><span></span>
                     </div>
                 </div>
             </div>
 
-            <!-- Post Call Summary Content -->
+            <!-- Summary Tab -->
             <div class="tab-content hidden" id="summary-tab-content">
                 <div class="summary-scroll" id="summary-scroll">
-                    <!-- Loaded dynamically -->
+                    <div class="empty-transcript-message">
+                        <i class="fa-solid fa-chart-bar"></i>
+                        <p>End a conversation to see your call analytics here.</p>
+                    </div>
                 </div>
             </div>
         </section>
     </main>
 
-    <!-- Floating Orb Widget (Collapsed State) -->
+    <!-- Floating Orb Widget -->
     <div class="floating-widget-container" id="floating-widget">
+        <div class="widget-tooltip">Voice Demo</div>
         <div class="widget-orb" id="widget-orb-click">
             <i class="fa-solid fa-wave-square"></i>
             <span class="widget-pulse"></span>
         </div>
-        <div class="widget-tooltip">Voice Demo</div>
     </div>
 
-    <!-- Main JavaScript Logic -->
+    <!-- Main JS (loaded last, after DOM is ready) -->
     <script src="/static/js/voice-agent.js"></script>
 </body>
 </html>

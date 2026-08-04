@@ -34,7 +34,39 @@ async def lifespan(app: FastAPI):
         await rag.initialize_collection()
     except Exception as e:
         logger.error(f"Failed to auto-initialize RAG collection: {e}")
-        
+
+    # Auto-seed voice profiles if table is empty (idempotent)
+    try:
+        from app.db.session import get_session_maker
+        from app.voice_demo.models.voice_profile import VoiceProfile
+        from sqlalchemy import select, func
+        import json as _json
+        import uuid as _uuid
+
+        _session_maker = get_session_maker()
+        async with _session_maker() as _seed_db:
+            count_res = await _seed_db.execute(
+                select(func.count()).select_from(VoiceProfile)
+            )
+            count = count_res.scalar()
+            if count == 0:
+                logger.info("[Startup] voice_profiles table empty — seeding default voices...")
+                _profiles = [
+                    VoiceProfile(id=_uuid.UUID("550e8400-e29b-41d4-a716-446655440001"), name="Sophia",  description="Professional Female",    gender="Female", supported_languages="English,Hindi",         voice_provider="melotts", voice_configuration=_json.dumps({"speaker_id": "EN_INDIA", "speed": 0.95}), status="active"),
+                    VoiceProfile(id=_uuid.UUID("550e8400-e29b-41d4-a716-446655440002"), name="Maya",    description="Friendly Female",          gender="Female", supported_languages="English,Telugu",        voice_provider="melotts", voice_configuration=_json.dumps({"speaker_id": "EN_INDIA", "speed": 1.0}),  status="active"),
+                    VoiceProfile(id=_uuid.UUID("550e8400-e29b-41d4-a716-446655440003"), name="Ananya",  description="Customer Support",         gender="Female", supported_languages="English,Hindi,Telugu",  voice_provider="melotts", voice_configuration=_json.dumps({"speaker_id": "EN_INDIA", "speed": 1.05}), status="active"),
+                    VoiceProfile(id=_uuid.UUID("550e8400-e29b-41d4-a716-446655440004"), name="Arjun",   description="Sales Specialist",         gender="Male",   supported_languages="English,Hindi",         voice_provider="melotts", voice_configuration=_json.dumps({"speaker_id": "EN_INDIA", "speed": 1.0}),  status="active"),
+                    VoiceProfile(id=_uuid.UUID("550e8400-e29b-41d4-a716-446655440005"), name="David",   description="Enterprise Consultant",    gender="Male",   supported_languages="English",               voice_provider="melotts", voice_configuration=_json.dumps({"speaker_id": "EN_US",    "speed": 0.98}), status="active"),
+                ]
+                _seed_db.add_all(_profiles)
+                await _seed_db.commit()
+                logger.info("[Startup] Voice profiles seeded successfully.")
+            else:
+                logger.info(f"[Startup] voice_profiles has {count} profiles — skip seed.")
+    except Exception as e:
+        logger.error(f"[Startup] Voice profile auto-seed failed (non-fatal): {e}")
+
+
     # Pre-load heavy Speech AI models in the background to prevent startup timeouts and memory spikes
     try:
         import asyncio

@@ -2,7 +2,7 @@ import uuid
 import json
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import numpy as np
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
@@ -202,9 +202,10 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
         "campaign_id": campaign.id,
         "customer_id": customer.id,
         "voice_profile": resolved_voice,
+        "voice_config": voice_config_dict,        # CRITICAL: required by WS handler
         "language": setup.language,
         "industry": setup.industry,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
         "start_time": None,
         "end_time": None,
         "transcript": []
