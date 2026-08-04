@@ -456,11 +456,8 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
             elif "bytes" in data:
                 binary_data = data["bytes"]
                 
-                # Transcode Int16 PCM (320 bytes per 20ms) to G.711 mu-law (160 bytes)
-                if len(binary_data) == 320:
-                    mu_law_audio = pcm16_to_ulaw(binary_data)
-                else:
-                    mu_law_audio = binary_data
+                # Transcode Int16 PCM from browser to G.711 mu-law (half the size in bytes)
+                mu_law_audio = pcm16_to_ulaw(binary_data)
 
                 # VAD Interruption Checks when AI is speaking
                 if sm.is_ai_speaking():

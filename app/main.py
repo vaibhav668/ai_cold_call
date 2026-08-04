@@ -152,6 +152,12 @@ async def voice_agent_page():
     from fastapi.responses import FileResponse
     return FileResponse("static/voice-agent.html")
 
+# Serve Favicon to prevent 404 errors
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon_route():
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
 # Mount Static Files Dashboard
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

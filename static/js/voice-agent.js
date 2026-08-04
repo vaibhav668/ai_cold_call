@@ -32,9 +32,9 @@ function getApiBase() {
 }
 
 function getWsBase() {
-    const host = window.location.hostname;
-    if (host.includes("vercel.app")) {
-        return RENDER_WS_BACKEND;
+    const apiBase = getApiBase();
+    if (apiBase) {
+        return apiBase.replace(/^http/, "ws");
     }
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${window.location.host}`;
@@ -206,7 +206,12 @@ function createAvatarElement(voice, sizePx) {
 
     const fallbackSrc = makeSvgAvatar(voice.name, voice.gender);
     if (voice.avatar && voice.avatar !== "null" && voice.avatar !== "undefined") {
-        img.src = voice.avatar;
+        let avatarUrl = voice.avatar;
+        // Rewrite local .png to .svg to match premium vector files on disk
+        if (avatarUrl.includes("/static/images/avatars/") && avatarUrl.endsWith(".png")) {
+            avatarUrl = avatarUrl.replace(".png", ".svg");
+        }
+        img.src = avatarUrl;
         img.onerror = function() { this.src = fallbackSrc; this.onerror = null; };
     } else {
         img.src = fallbackSrc;
