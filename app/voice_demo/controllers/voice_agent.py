@@ -625,7 +625,7 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
     finally:
         # Save end time
         meta["end_time"] = time.time()
-        logger.info(f"[DEMO-WS] Cleaning up active tasks for session {session_id}")
+        logger.info(f"[DEMO-WS] Cleaning up active tasks and memory for session {session_id}")
         
         # Cleanup
         if pipeline_task and not pipeline_task.done():
@@ -635,7 +635,14 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        audio_queue.put_nowait(None)
+        # Flush the queue to release references to all audio chunks
+        try:
+            audio_queue.put_nowait(None)
+            while not audio_queue.empty():
+                audio_queue.get_nowait()
+        except Exception:
+            pass
+
         cancel_event.set()
         send_task.cancel()
         try:
@@ -645,6 +652,36 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
         try:
             await websocket.close()
+        except Exception:
+            pass
+
+        # Discard temporary buffers and queue references
+        try:
+            utterance_buffer.clear()
+        except Exception:
+            pass
+
+        # Proactively clear session states and run garbage collection
+        try:
+            from app.services.session_manager import SessionManager
+            await SessionManager().clear_session(session_id)
+        except Exception:
+            pass
+
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
+        # Log post-session final RSS memory usage
+        try:
+            import psutil
+            rss = psutil.Process().memory_info().rss / (1024 * 1024)
+            logger.info(f"[MEMORY] WebSocket disconnected. Active session cleaned. Current RSS: {rss:.2f} MB")
         except Exception:
             pass
 

@@ -1,19 +1,34 @@
 import asyncio
+import os
 from typing import List
 from app.core.logging import logger
 from app.services.embeddings.base import EmbeddingProvider
 
 class BGEM3EmbeddingProvider(EmbeddingProvider):
     """
-    Multilingual embedding provider using the BAAI/bge-m3 model.
-    Generates 1024-dimensional vectors.
+    Multilingual embedding provider using the BAAI/bge-m3 model or all-MiniLM-L6-v2.
+    Dynamically adjusts dimension based on environment memory footprint constraint.
     """
 
     _model_instance = None
     _model_lock = asyncio.Lock()
+    _dimension = 1024
+
+    def __init__(self) -> None:
+        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
+        try:
+            import psutil
+            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
+                low_mem = True
+        except Exception:
+            pass
+
+        self.model_name = os.environ.get("EMBEDDING_MODEL_NAME", "BAAI/bge-m3" if not low_mem else "all-MiniLM-L6-v2")
+        # Dynamic dimension resolution based on active model name
+        BGEM3EmbeddingProvider._dimension = 1024 if "bge-m3" in self.model_name else 384
 
     @classmethod
-    async def _get_model(cls):
+    async def _get_model(cls, model_name: str):
         """Loads and caches the SentenceTransformer model instance as a singleton."""
         if cls._model_instance is not None:
             return cls._model_instance
@@ -24,15 +39,21 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
 
             try:
                 from sentence_transformers import SentenceTransformer
-                logger.info("[EMBEDDINGS] Initializing BAAI/bge-m3 model locally (CPU)...")
+                logger.info(f"[EMBEDDINGS] Initializing model '{model_name}' locally (CPU)...")
                 # Run blocking load inside executor
                 def load():
-                    return SentenceTransformer("BAAI/bge-m3", device="cpu")
+                    return SentenceTransformer(model_name, device="cpu")
                 
                 cls._model_instance = await asyncio.get_event_loop().run_in_executor(None, load)
-                logger.info("[EMBEDDINGS] BAAI/bge-m3 model loaded successfully.")
+                logger.info(f"[EMBEDDINGS] SentenceTransformer model '{model_name}' loaded successfully.")
+                try:
+                    import psutil
+                    rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                    logger.info(f"[MEMORY] Embedding Model loaded: RSS {rss:.2f} MB")
+                except Exception:
+                    pass
             except Exception as e:
-                logger.error(f"[EMBEDDINGS] Failed to initialize local bge-m3 model: {e}. Mock fallback enabled.")
+                logger.error(f"[EMBEDDINGS] Failed to initialize local model: {e}. Mock fallback enabled.")
                 cls._model_instance = "FAILED"
             return cls._model_instance
 
@@ -41,19 +62,21 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
             return []
 
         # 1. Try local SentenceTransformer model
-        model = await self._get_model()
+        model = await self._get_model(self.model_name)
         if model != "FAILED" and model is not None:
             try:
                 def encode_texts():
-                    # Generate embeddings, returns list of numpy arrays
-                    raw_vecs = model.encode(texts, normalize_embeddings=True)
+                    import torch
+                    with torch.inference_mode():
+                        # Generate embeddings, returns list of numpy arrays
+                        raw_vecs = model.encode(texts, normalize_embeddings=True)
                     return [vec.tolist() for vec in raw_vecs]
 
                 return await asyncio.get_event_loop().run_in_executor(None, encode_texts)
             except Exception as e:
                 logger.error(f"[EMBEDDINGS] Local embedding encoding failed: {e}")
 
-        # 2. Mock fallback (1024-dimensional vectors)
+        # 2. Mock fallback (dimension is dynamic)
         return self._mock_embeddings(texts)
 
     async def get_query_embedding(self, text: str) -> List[float]:
@@ -62,14 +85,15 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
 
     @property
     def dimension(self) -> int:
-        return 1024
+        return self._dimension
 
     def _mock_embeddings(self, texts: List[str]) -> List[List[float]]:
         import random
-        logger.warning("[EMBEDDINGS] SentenceTransformer failed or not initialized. Returning 1024-d mock embeddings...")
+        dim = self.dimension
+        logger.warning(f"[EMBEDDINGS] SentenceTransformer failed or not initialized. Returning {dim}-d mock embeddings...")
         results = []
         for text in texts:
             # Deterministic mock based on text length for stable testing
             random.seed(len(text))
-            results.append([random.uniform(-1.0, 1.0) for _ in range(1024)])
+            results.append([random.uniform(-1.0, 1.0) for _ in range(dim)])
         return results

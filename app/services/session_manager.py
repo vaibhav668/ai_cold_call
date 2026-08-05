@@ -43,3 +43,12 @@ class SessionManager:
         _in_memory_states.pop(call_id, None)
         _in_memory_messages.pop(call_id, None)
         _in_memory_metadata.pop(call_id, None)
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        logger.info(f"[SessionManager] Purged local session cache for {call_id} and ran garbage collection.")

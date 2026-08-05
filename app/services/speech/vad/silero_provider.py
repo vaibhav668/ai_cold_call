@@ -36,6 +36,12 @@ class SileroVADProvider(VoiceActivityDetector):
             if SileroVADProvider._model_instance is None:
                 logger.info("[VAD] Loading Silero VAD model...")
                 SileroVADProvider._model_instance = load_silero_vad()
+                try:
+                    import psutil
+                    rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                    logger.info(f"[MEMORY] Silero loaded: RSS {rss:.2f} MB")
+                except Exception:
+                    pass
             
             self.model = SileroVADProvider._model_instance
             if self.model is not None and self.model != "FAILED":
@@ -79,7 +85,8 @@ class SileroVADProvider(VoiceActivityDetector):
             try:
                 import torch
                 block_tensor = torch.tensor(block, dtype=torch.float32)
-                result = self.vad_iterator(block_tensor)
+                with torch.inference_mode():
+                    result = self.vad_iterator(block_tensor)
                 
                 if result:
                     if "start" in result:

@@ -38,7 +38,15 @@ class FasterWhisperProvider(SpeechToTextProvider):
     _model_lock = asyncio.Lock()
 
     def __init__(self) -> None:
-        self.model_size = os.environ.get("WHISPER_MODEL", "base")
+        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
+        try:
+            import psutil
+            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
+                low_mem = True
+        except Exception:
+            pass
+        default_size = "tiny.en" if low_mem else "base"
+        self.model_size = os.environ.get("WHISPER_MODEL", default_size)
         self.api_key = os.environ.get("GROQ_API_KEY", "")
 
     @classmethod
@@ -73,6 +81,12 @@ class FasterWhisperProvider(SpeechToTextProvider):
                     )
                 cls._model_instance = await asyncio.get_event_loop().run_in_executor(None, load_model)
                 logger.info(f"[STT] Faster-Whisper model '{model_size}' successfully loaded.")
+                try:
+                    import psutil
+                    rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                    logger.info(f"[MEMORY] Whisper loaded: RSS {rss:.2f} MB")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"[STT] Could not initialize local Faster-Whisper model: {e}")
                 cls._model_instance = "FAILED"
@@ -98,15 +112,17 @@ class FasterWhisperProvider(SpeechToTextProvider):
                 x_16k = np.repeat(x_8k, 2)
 
                 def run_transcription():
-                    # Whisper large-v3-turbo detects language dynamically if language=None
-                    segments, info = model.transcribe(
-                        x_16k,
-                        beam_size=3,
-                        language=language,
-                        vad_filter=True
-                    )
-                    text = " ".join([seg.text for seg in segments]).strip()
-                    return text, info.language
+                    import torch
+                    with torch.inference_mode():
+                        # Whisper large-v3-turbo detects language dynamically if language=None
+                        segments, info = model.transcribe(
+                            x_16k,
+                            beam_size=3,
+                            language=language,
+                            vad_filter=True
+                        )
+                        text = " ".join([seg.text for seg in segments]).strip()
+                        return text, info.language
 
                 text, detected_lang = await asyncio.get_event_loop().run_in_executor(None, run_transcription)
                 if text and text not in _SILENCE_TOKENS and len(text) > 2:

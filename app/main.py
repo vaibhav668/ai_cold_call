@@ -16,6 +16,24 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure Torch optimizations on boot
+    try:
+        import torch
+        torch.set_grad_enabled(False)
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        logger.info("[TORCH] PyTorch optimized for low memory: set_grad_enabled(False), threads=1")
+    except ImportError:
+        pass
+
+    # Log initial memory usage on boot
+    try:
+        import psutil
+        rss = psutil.Process().memory_info().rss / (1024 * 1024)
+        logger.info(f"[MEMORY] Startup initial RSS: {rss:.2f} MB")
+    except Exception:
+        pass
+
     # Startup hook: Initialize external clients
     logger.info("Running database connectivity diagnostics...")
     try:
@@ -67,52 +85,21 @@ async def lifespan(app: FastAPI):
         logger.error(f"[Startup] Voice profile auto-seed failed (non-fatal): {e}")
 
 
-    # Pre-load heavy Speech AI models in the background to prevent startup timeouts and memory spikes
+    # Pre-load only lightweight models (VAD) in the background to keep memory usage low (<350MB idle)
     try:
         import asyncio
-        from app.services.speech.tts.melotts_provider import MeloTTSProvider
-        from app.services.speech.stt.faster_whisper_provider import FasterWhisperProvider
         import os
 
         async def load_models_sequentially():
             if os.environ.get("PRELOAD_MODELS", "true").lower() != "true":
-                logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true). Skipping to prevent startup timeouts.")
+                logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true).")
                 return
 
             # Wait 5 seconds after startup to ensure web server is fully responsive
             await asyncio.sleep(5.0)
-
-            tts_provider = os.environ.get("TTS_PROVIDER", "melotts").lower()
-
-            if tts_provider == "edge_tts":
-                # EdgeTTS is API-based — nothing to preload locally
-                logger.info("TTS_PROVIDER=edge_tts — skipping local MeloTTS preload (no RAM cost).")
-            else:
-                try:
-                    logger.info("Pre-loading MeloTTS model in the background...")
-                    await MeloTTSProvider._get_model_and_speaker()
-                    logger.info("MeloTTS model pre-loaded successfully.")
-                except Exception as e:
-                    logger.error(f"Failed to pre-load MeloTTS: {e}")
-                
+            
             try:
-                logger.info("Pre-loading CTranslate2 Whisper model in the background...")
-                model_size = os.environ.get("WHISPER_MODEL", "base")
-                await FasterWhisperProvider._get_model(model_size)
-                logger.info("CTranslate2 Whisper model pre-loaded successfully.")
-            except Exception as e:
-                logger.error(f"Failed to pre-load CTranslate2 Whisper: {e}")
-
-            try:
-                logger.info("Pre-loading BGEM3EmbeddingProvider in the background...")
-                from app.services.embeddings.bge_m3_provider import BGEM3EmbeddingProvider
-                await BGEM3EmbeddingProvider._get_model()
-                logger.info("BGEM3EmbeddingProvider pre-loaded successfully.")
-            except Exception as e:
-                logger.error(f"Failed to pre-load BGEM3EmbeddingProvider: {e}")
-
-            try:
-                logger.info("Pre-loading SileroVADProvider in the background...")
+                logger.info("Pre-loading lightweight SileroVADProvider in the background...")
                 from app.services.speech.vad.silero_provider import SileroVADProvider
                 def load_vad():
                     return SileroVADProvider()
@@ -125,7 +112,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to register background Speech AI models preloading: {e}")
 
-    
     yield
     
     # Shutdown hook: Clean up pools

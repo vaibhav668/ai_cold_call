@@ -21,6 +21,12 @@ class ChromaManager:
                 try:
                     self._client = chromadb.PersistentClient(path=settings.CHROMA_DB_PATH)
                     logger.info("ChromaDB persistent client successfully connected.")
+                    try:
+                        import psutil
+                        rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                        logger.info(f"[MEMORY] Chroma loaded: RSS {rss:.2f} MB")
+                    except Exception:
+                        pass
                     return
                 except Exception as e:
                     err_msg = str(e).lower()

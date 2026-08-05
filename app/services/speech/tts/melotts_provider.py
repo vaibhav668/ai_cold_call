@@ -124,6 +124,12 @@ class MeloTTSProvider(TextToSpeechProvider):
 
                 cls._model_instance, cls._speaker_id = await asyncio.get_event_loop().run_in_executor(None, load)
                 logger.info("[TTS] MeloTTS model loaded successfully.")
+                try:
+                    import psutil
+                    rss = psutil.Process().memory_info().rss / (1024 * 1024)
+                    logger.info(f"[MEMORY] MeloTTS loaded: RSS {rss:.2f} MB")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"[TTS] Could not initialize local MeloTTS: {e}. Fallback to mock active.")
                 cls._model_instance = "FAILED"
@@ -161,7 +167,9 @@ class MeloTTSProvider(TextToSpeechProvider):
 
                 try:
                     def generate():
-                        model.tts_to_file(processed_text, speaker_id, tmp_path, speed=speed)
+                        import torch
+                        with torch.inference_mode():
+                            model.tts_to_file(processed_text, speaker_id, tmp_path, speed=speed)
                     
                     # Run synthesis in executor
                     await asyncio.get_event_loop().run_in_executor(None, generate)
