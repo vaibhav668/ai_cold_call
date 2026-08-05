@@ -15,13 +15,8 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
     _dimension = 1024
 
     def __init__(self) -> None:
-        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
-        try:
-            import psutil
-            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
-                low_mem = True
-        except Exception:
-            pass
+        from app.core.config import check_low_memory
+        low_mem = check_low_memory()
 
         self.model_name = os.environ.get("EMBEDDING_MODEL_NAME", "BAAI/bge-m3" if not low_mem else "all-MiniLM-L6-v2")
         # Dynamic dimension resolution based on active model name

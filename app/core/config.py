@@ -64,3 +64,37 @@ settings = Settings()
 if not settings.DATABASE_URL or settings.DATABASE_URL.strip() == "":
     raise ValueError("DATABASE_URL environment variable is missing or empty. Application startup aborted.")
 
+
+def check_low_memory() -> bool:
+    """
+    Unified check to determine if the system is running in a memory-constrained
+    environment (e.g. Render 512MB container, cgroups limit, or low host RAM).
+    """
+    import os
+    if os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true":
+        return True
+
+    # 1. Check cgroups memory limit (accurate for container limits like Render)
+    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    val = f.read().strip()
+                    if val and val.isdigit():
+                        limit = int(val)
+                        # Render limit is usually 512MB (536870912 bytes)
+                        if limit < 1024 * 1024 * 1024:  # < 1GB
+                            return True
+        except Exception:
+            pass
+
+    # 2. Check psutil as a fallback
+    try:
+        import psutil
+        if psutil.virtual_memory().total < 1024 * 1024 * 1024:
+            return True
+    except Exception:
+        pass
+
+    return False
+

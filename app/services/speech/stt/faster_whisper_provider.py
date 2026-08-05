@@ -38,13 +38,8 @@ class FasterWhisperProvider(SpeechToTextProvider):
     _model_lock = asyncio.Lock()
 
     def __init__(self) -> None:
-        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
-        try:
-            import psutil
-            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
-                low_mem = True
-        except Exception:
-            pass
+        from app.core.config import check_low_memory
+        low_mem = check_low_memory()
         default_size = "tiny.en" if low_mem else "base"
         self.model_size = os.environ.get("WHISPER_MODEL", default_size)
         self.api_key = os.environ.get("GROQ_API_KEY", "")

@@ -17,14 +17,8 @@ class VoiceService:
     """
 
     def __init__(self) -> None:
-        import os
-        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
-        try:
-            import psutil
-            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
-                low_mem = True
-        except Exception:
-            pass
+        from app.core.config import check_low_memory
+        low_mem = check_low_memory()
 
         provider_name = settings.TTS_PROVIDER.lower()
         if low_mem:
