@@ -17,9 +17,21 @@ class VoiceService:
     """
 
     def __init__(self) -> None:
+        import os
+        low_mem = os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true"
+        try:
+            import psutil
+            if psutil.virtual_memory().total < 1024 * 1024 * 1024:  # < 1GB
+                low_mem = True
+        except Exception:
+            pass
+
         provider_name = settings.TTS_PROVIDER.lower()
-        if provider_name == "edge_tts":
+        if low_mem:
+            logger.info("[VoiceService] Low memory environment detected (< 1GB RAM). Enforcing EdgeTTSProvider to prevent OOM crash.")
             self.provider: TextToSpeechProvider = EdgeTTSProvider()
+        elif provider_name == "edge_tts":
+            self.provider = EdgeTTSProvider()
             logger.info("[VoiceService] Using EdgeTTSProvider (Microsoft Edge TTS).")
         else:
             # Try MeloTTS; if it fails at init time, fall back to EdgeTTS
