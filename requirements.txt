@@ -19,6 +19,15 @@ pypdf>=4.0.0
 openai>=1.14.0
 miniaudio>=1.60.0
 cn2an  # Required by MeloTTS text normalization pipeline
+pypinyin>=0.50.0  # MeloTTS: Chinese phonetic transcription
+jieba>=0.42.1     # MeloTTS: Chinese word segmentation
+mecab-python3>=1.0.6  # MeloTTS: Japanese morphological analysis
+unidic-lite>=1.0.8    # MeloTTS: Japanese dictionary for MeCab
+pykakasi>=2.2.1   # MeloTTS: Japanese romanization
+fugashi>=1.3.0    # MeloTTS: MeCab wrapper
+g2p-en>=2.1.0     # MeloTTS: English grapheme-to-phoneme
+jamo>=0.4.1       # MeloTTS: Korean jamo processing
+gruut>=2.2.3      # MeloTTS: Multilingual phonemizer
 
 # Speech AI subsystem requirements
 faster-whisper>=1.0.0

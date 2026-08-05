@@ -16,10 +16,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install MeloTTS and its strict pinned dependencies last
-# cn2an==0.5.22 and librosa==0.9.1 are required by MeloTTS 0.1.x
+# Install MeloTTS; all required deps (pypinyin, jieba, mecab, etc.) are in requirements.txt
 RUN pip install --no-cache-dir cn2an==0.5.22 || pip install --no-cache-dir cn2an
-RUN pip install --no-cache-dir --no-deps git+https://github.com/myshell-ai/MeloTTS.git
+RUN pip install --no-cache-dir git+https://github.com/myshell-ai/MeloTTS.git
 
 # ─── Stage 2: Final ───────────────────────────────────────────────────────────
 FROM python:3.11-slim AS final
