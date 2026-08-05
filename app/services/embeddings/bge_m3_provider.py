@@ -18,7 +18,16 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
         from app.core.config import check_low_memory
         low_mem = check_low_memory()
 
-        self.model_name = os.environ.get("EMBEDDING_MODEL_NAME", "BAAI/bge-m3" if not low_mem else "all-MiniLM-L6-v2")
+        configured_model = os.environ.get("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2" if low_mem else "BAAI/bge-m3")
+        if low_mem and "bge-m3" in configured_model.lower():
+            logger.warning(
+                f"[EMBEDDINGS] Low-memory environment detected. Overriding heavy model '{configured_model}' "
+                f"to lightweight 'all-MiniLM-L6-v2' (384-d, ~30MB RAM) to prevent 600MB+ RSS OOM crash."
+            )
+            self.model_name = "all-MiniLM-L6-v2"
+        else:
+            self.model_name = configured_model
+
         # Dynamic dimension resolution based on active model name
         BGEM3EmbeddingProvider._dimension = 1024 if "bge-m3" in self.model_name else 384
 
