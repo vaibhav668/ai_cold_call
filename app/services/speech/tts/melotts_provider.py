@@ -196,14 +196,15 @@ class MeloTTSProvider(TextToSpeechProvider):
                     )
                     
                     import audioop
-                    pcm_len = len(decoded.raw_data)
+                    pcm_bytes = decoded.samples.tobytes()
+                    pcm_len = len(pcm_bytes)
                     samples_count = pcm_len // 2
                     duration_sec = samples_count / 8000.0
                     
                     logger.info(f"[TTS] MeloTTS PCM Output: sample_rate=8000, channels=1, dtype=int16, buffer_length={pcm_len} bytes, samples_count={samples_count}, duration={duration_sec:.3f}s")
 
                     # Convert PCM 16-bit to 8-bit G.711 mu-law
-                    mulaw_bytes = audioop.lin2ulaw(decoded.raw_data, 2)
+                    mulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
                     _decode_time = _time.perf_counter() - _start_decode
                     logger.info(f"[TTS] Transcoded PCM -> G.711 mu-law in {_decode_time:.3f}s. Yielding chunks...")
 

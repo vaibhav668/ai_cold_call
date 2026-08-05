@@ -91,7 +91,7 @@ def _mp3_to_mulaw_chunks(mp3_bytes: bytes, chunk_size: int = 160) -> list:
             nchannels=1,
             sample_rate=8000
         )
-        pcm_bytes = decoded.raw_data
+        pcm_bytes = decoded.samples.tobytes()
         pcm_len = len(pcm_bytes)
         samples_count = pcm_len // 2
         duration_sec = samples_count / 8000.0
