@@ -9,6 +9,8 @@ services:
     envVars:
       - key: PORT
         value: 8000
+      - key: TTS_PROVIDER
+        value: edge_tts
       - key: DATABASE_URL
         sync: false # User will supply their own PostgreSQL connection string in the Render Dashboard
       - key: VECTOR_DB_PROVIDER

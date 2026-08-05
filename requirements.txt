@@ -29,6 +29,10 @@ g2p-en>=2.1.0     # MeloTTS: English grapheme-to-phoneme
 jamo>=0.4.1       # MeloTTS: Korean jamo processing
 gruut>=2.2.3      # MeloTTS: Multilingual phonemizer
 
+# EdgeTTS provider (free Microsoft Edge TTS, no local model, no API key)
+edge-tts>=6.1.9
+pydub>=0.25.1     # MP3 -> PCM conversion for EdgeTTS pipeline
+
 # Speech AI subsystem requirements
 faster-whisper>=1.0.0
 ctranslate2>=4.0.0

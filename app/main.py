@@ -79,15 +79,21 @@ async def lifespan(app: FastAPI):
                 logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true). Skipping to prevent startup timeouts.")
                 return
 
-            # Wait 5 seconds after startup to ensure web server is fully responsive and listening
+            # Wait 5 seconds after startup to ensure web server is fully responsive
             await asyncio.sleep(5.0)
-            
-            try:
-                logger.info("Pre-loading MeloTTS model in the background...")
-                await MeloTTSProvider._get_model_and_speaker()
-                logger.info("MeloTTS model pre-loaded successfully.")
-            except Exception as e:
-                logger.error(f"Failed to pre-load MeloTTS: {e}")
+
+            tts_provider = os.environ.get("TTS_PROVIDER", "melotts").lower()
+
+            if tts_provider == "edge_tts":
+                # EdgeTTS is API-based — nothing to preload locally
+                logger.info("TTS_PROVIDER=edge_tts — skipping local MeloTTS preload (no RAM cost).")
+            else:
+                try:
+                    logger.info("Pre-loading MeloTTS model in the background...")
+                    await MeloTTSProvider._get_model_and_speaker()
+                    logger.info("MeloTTS model pre-loaded successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to pre-load MeloTTS: {e}")
                 
             try:
                 logger.info("Pre-loading CTranslate2 Whisper model in the background...")
@@ -118,6 +124,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(load_models_sequentially())
     except Exception as e:
         logger.error(f"Failed to register background Speech AI models preloading: {e}")
+
     
     yield
     
