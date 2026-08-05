@@ -110,14 +110,15 @@ class MeloTTSProvider(TextToSpeechProvider):
                 def load():
                     # Ensure MeloTTS caches downloads to a writable directory.
                     # MeloTTS uses XDG_CACHE_HOME / cached-path internally.
-                    cache_dir = os.environ.get("XDG_CACHE_HOME", "/tmp/xdg_cache")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
-                    os.environ.setdefault("HF_HOME", os.environ.get("HF_HOME", "/tmp/hf_cache"))
+                    if os.name != "nt":
+                        cache_dir = os.environ.get("XDG_CACHE_HOME", "/tmp/xdg_cache")
+                        os.makedirs(cache_dir, exist_ok=True)
+                        os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+                        os.environ.setdefault("HF_HOME", os.environ.get("HF_HOME", "/tmp/hf_cache"))
 
                     model = TTS(language='EN', device='auto')
                     # Use Indian English accent for natural multilingual Indic voice
-                    spk_id = model.hps.data.spk2id.get('EN_INDIA', 0)
+                    spk_id = getattr(model.hps.data.spk2id, 'EN_INDIA', 0)
                     return model, spk_id
 
                 cls._model_instance, cls._speaker_id = await asyncio.get_event_loop().run_in_executor(None, load)
@@ -149,7 +150,7 @@ class MeloTTSProvider(TextToSpeechProvider):
                 if voice_config:
                     spk_name = voice_config.get("speaker_id")
                     if spk_name and hasattr(model, "hps") and hasattr(model.hps, "data") and hasattr(model.hps.data, "spk2id"):
-                        speaker_id = model.hps.data.spk2id.get(spk_name, default_speaker_id)
+                        speaker_id = getattr(model.hps.data.spk2id, spk_name, default_speaker_id)
                     speed = voice_config.get("speed", 1.0)
 
                 # Create temporary file to store MeloTTS output wav

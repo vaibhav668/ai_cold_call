@@ -58,14 +58,18 @@ class FasterWhisperProvider(SpeechToTextProvider):
                 def load_model():
                     # Explicitly set download_root to /tmp to ensure write access on all
                     # containerized platforms (Render, Railway, etc.) regardless of HOME dir.
-                    cache_dir = os.environ.get("HF_HOME", "/tmp/hf_cache")
-                    os.makedirs(cache_dir, exist_ok=True)
+                    if os.name != "nt":
+                        cache_dir = os.environ.get("HF_HOME", "/tmp/hf_cache")
+                        os.makedirs(cache_dir, exist_ok=True)
+                        download_root = cache_dir
+                    else:
+                        download_root = None
                     return WhisperModel(
                         model_size,
                         device="cpu",
                         compute_type="int8",
                         cpu_threads=4,
-                        download_root=cache_dir
+                        download_root=download_root
                     )
                 cls._model_instance = await asyncio.get_event_loop().run_in_executor(None, load_model)
                 logger.info(f"[STT] Faster-Whisper model '{model_size}' successfully loaded.")

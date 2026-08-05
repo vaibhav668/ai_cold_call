@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
         import os
 
         async def load_models_sequentially():
-            if os.environ.get("PRELOAD_MODELS", "false").lower() != "true":
+            if os.environ.get("PRELOAD_MODELS", "true").lower() != "true":
                 logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true). Skipping to prevent startup timeouts.")
                 return
 
@@ -96,6 +96,24 @@ async def lifespan(app: FastAPI):
                 logger.info("CTranslate2 Whisper model pre-loaded successfully.")
             except Exception as e:
                 logger.error(f"Failed to pre-load CTranslate2 Whisper: {e}")
+
+            try:
+                logger.info("Pre-loading BGEM3EmbeddingProvider in the background...")
+                from app.services.embeddings.bge_m3_provider import BGEM3EmbeddingProvider
+                await BGEM3EmbeddingProvider._get_model()
+                logger.info("BGEM3EmbeddingProvider pre-loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to pre-load BGEM3EmbeddingProvider: {e}")
+
+            try:
+                logger.info("Pre-loading SileroVADProvider in the background...")
+                from app.services.speech.vad.silero_provider import SileroVADProvider
+                def load_vad():
+                    return SileroVADProvider()
+                await asyncio.get_event_loop().run_in_executor(None, load_vad)
+                logger.info("SileroVADProvider pre-loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to pre-load SileroVADProvider: {e}")
 
         asyncio.create_task(load_models_sequentially())
     except Exception as e:

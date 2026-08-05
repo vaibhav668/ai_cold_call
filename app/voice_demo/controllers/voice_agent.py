@@ -310,6 +310,9 @@ JSON SCHEMA:
 }}
 """
     llm = LLMService()
+    import time as _time
+    summary_data = {}
+    _summary_start = _time.perf_counter()
     try:
         content, _ = await llm.generate_completion([{"role": "user", "content": prompt}], tools=None)
         # Robustly extract JSON block from text response
@@ -332,6 +335,9 @@ JSON SCHEMA:
             "knowledge_retrieved": ["CityCare parking policy" if industry == "hospital" else "Skyline Developers brochure"],
             "recommended_next_action": "Verify appointment in calendar." if industry == "hospital" else "Assign sales rep for property tour."
         }
+    finally:
+        _summary_latency = _time.perf_counter() - _summary_start
+        logger.info(f"[METRICS] Summary LLM Latency: {_summary_latency:.3f}s")
 
     extracted_vars = summary_data.get("extracted_variables", summary_data.get("extracted_information", {}))
     if not isinstance(extracted_vars, dict):
@@ -561,8 +567,13 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                                 pass
 
                         async def _transcribe_and_run(audio: bytes):
+                            import time as _time
                             # Transcribe user text in target language
+                            _stt_start = _time.perf_counter()
                             transcript = await stt.transcribe_utterance(audio, language=language_code)
+                            _stt_latency = _time.perf_counter() - _stt_start
+                            logger.info(f"[METRICS] STT Latency: {_stt_latency:.3f}s | audio_len={len(audio)} bytes")
+
                             if not transcript:
                                 logger.info(f"[DEMO-WS] Empty transcript. Returning to WAITING.")
                                 await _send_state_change(CallState.WAITING_FOR_CUSTOMER)
@@ -653,7 +664,9 @@ async def _run_pipeline(
     state_callback = None
 ) -> None:
     """Core turn-taking pipeline: ConversationEngine → MeloTTS synthesis."""
-    logger.info(f"[DEMO-PIPELINE] Pipeline started for {call_uuid}")
+    import time as _time
+    _pipeline_start = _time.perf_counter()
+    logger.info(f"[DEMO-PIPELINE] Pipeline started for {call_uuid} | user_text='{user_text[:60]}'")
 
     # 1. Transition to THINKING
     if state_callback:
@@ -664,6 +677,7 @@ async def _run_pipeline(
     response_text = ""
     should_hangup = False
 
+    _llm_start = _time.perf_counter()
     async with llm_lock:
         try:
             async for db in get_db_session():
@@ -678,6 +692,8 @@ async def _run_pipeline(
         except Exception as e:
             logger.error(f"[DEMO-PIPELINE] Engine execution failed: {e}")
             response_text = "I am having trouble connecting to my network right now. Could you repeat that?"
+    _llm_latency = _time.perf_counter() - _llm_start
+    logger.info(f"[METRICS] LLM+DB Latency: {_llm_latency:.3f}s | response_len={len(response_text)} chars")
 
     logger.info(f"[DEMO-PIPELINE] Agent Response: '{response_text}'")
 
@@ -724,14 +740,23 @@ async def _run_pipeline(
 
     try:
         chunks_count = 0
+        _tts_start = _time.perf_counter()
+        _tts_ttfb = None
         async for audio_chunk in tts.stream_speech(response_text, cancel_event=cancel_event, language=language_code, voice_config=voice_config):
             if cancel_event.is_set():
                 break
+            if _tts_ttfb is None:
+                _tts_ttfb = _time.perf_counter() - _tts_start
+                logger.info(f"[METRICS] TTS TTFB: {_tts_ttfb:.3f}s")
             await audio_queue.put(audio_chunk)
             chunks_count += 1
-        logger.info(f"[DEMO-PIPELINE] Synthesized and queued {chunks_count} chunks.")
+        _tts_total = _time.perf_counter() - _tts_start
+        logger.info(f"[METRICS] TTS Total: {_tts_total:.3f}s | chunks={chunks_count}")
     except Exception as e:
         logger.error(f"[DEMO-PIPELINE] TTS generation error: {e}")
+
+    _pipeline_total = _time.perf_counter() - _pipeline_start
+    logger.info(f"[METRICS] Pipeline Total: {_pipeline_total:.3f}s | LLM={_llm_latency:.3f}s")
 
     if not cancel_event.is_set():
         if should_hangup:

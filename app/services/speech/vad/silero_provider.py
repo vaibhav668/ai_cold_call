@@ -23,6 +23,8 @@ class SileroVADProvider(VoiceActivityDetector):
     against Silero's 512-sample inference block requirement.
     """
 
+    _model_instance = None
+
     def __init__(self) -> None:
         self.model = None
         self.vad_iterator = None
@@ -31,19 +33,24 @@ class SileroVADProvider(VoiceActivityDetector):
 
         try:
             from silero_vad import load_silero_vad, VADIterator
-            logger.info("[VAD] Loading Silero VAD model...")
-            self.model = load_silero_vad()
-            # min_silence_duration_ms=400 (20 frames of 20ms) matches our previous VAD timing
-            self.vad_iterator = VADIterator(
-                self.model,
-                threshold=0.5,
-                sampling_rate=16000,
-                min_silence_duration_ms=400,
-                speech_pad_ms=30
-            )
-            logger.info("[VAD] Silero VAD model loaded successfully.")
+            if SileroVADProvider._model_instance is None:
+                logger.info("[VAD] Loading Silero VAD model...")
+                SileroVADProvider._model_instance = load_silero_vad()
+            
+            self.model = SileroVADProvider._model_instance
+            if self.model is not None and self.model != "FAILED":
+                # min_silence_duration_ms=400 (20 frames of 20ms) matches our previous VAD timing
+                self.vad_iterator = VADIterator(
+                    self.model,
+                    threshold=0.5,
+                    sampling_rate=16000,
+                    min_silence_duration_ms=400,
+                    speech_pad_ms=30
+                )
+                logger.info("[VAD] Silero VAD iterator initialized.")
         except Exception as e:
             logger.error(f"[VAD] Failed to initialize Silero VAD model: {e}. Fallback to RMS VAD enabled.")
+            SileroVADProvider._model_instance = "FAILED"
 
     def process_frame(self, audio_chunk: bytes) -> Optional[str]:
         if not audio_chunk or self.model is None or self.vad_iterator is None:
