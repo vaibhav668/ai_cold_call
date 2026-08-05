@@ -131,8 +131,8 @@ function setupListeners() {
     elStartBtn.addEventListener("click", startConversation);
     elEndBtn.addEventListener("click", stopConversation);
     elMuteBtn.addEventListener("click", toggleMute);
-    elTabTranscript.addEventListener("click", () => switchTab("transcript"));
-    elTabSummary.addEventListener("click", () => switchTab("summary"));
+    if (elTabTranscript) elTabTranscript.addEventListener("click", () => switchTab("transcript"));
+    if (elTabSummary) elTabSummary.addEventListener("click", () => switchTab("summary"));
     elWidgetOrb.addEventListener("click", () => {
         document.getElementById("circular-arena").scrollIntoView({ behavior: "smooth" });
     });
@@ -330,10 +330,10 @@ async function startConversation() {
     setOrbState(CallState.CONNECTED, "Setting up…");
 
     // Reset transcript panel
-    elTranscriptScroll.innerHTML = "";
-    elEmptyMsg.classList.remove("hidden");
-    elTabSummary.disabled = true;
-    switchTab("transcript");
+    if (elTranscriptScroll) elTranscriptScroll.innerHTML = "";
+    if (elEmptyMsg) elEmptyMsg.classList.remove("hidden");
+    if (elTabSummary) elTabSummary.disabled = true;
+    if (elTabTranscript) switchTab("transcript");
 
     try {
         // 1. Create backend session
@@ -406,7 +406,11 @@ async function startConversation() {
                 if (evt.code === 1006) {
                     errMsg = "Audio streaming failed or TTS generation crashed on the server (Code 1006).";
                 }
-                appendSystemMessage(errMsg);
+                if (elTranscriptScroll) {
+                    appendSystemMessage(errMsg);
+                } else {
+                    console.error(errMsg);
+                }
                 
                 // Transition UI state to error instead of abruptly destroying state
                 setOrbState(CallState.ERROR, "Failed");
@@ -422,9 +426,10 @@ async function startConversation() {
                 
                 elStatus.textContent = "Error";
                 elStatus.style.color = "var(--error-color)";
-                elTabSummary.disabled = false;
-                
-                fetchSummary();
+                if (elTabSummary) {
+                    elTabSummary.disabled = false;
+                    fetchSummary();
+                }
                 resetUIAfterCall();
             }
         };
@@ -468,8 +473,10 @@ async function stopConversation() {
     elStatus.textContent = "Ended";
     elStatus.style.color = "";
 
-    elTabSummary.disabled = false;
-    await fetchSummary();
+    if (elTabSummary) {
+        elTabSummary.disabled = false;
+        await fetchSummary();
+    }
     resetUIAfterCall();
 }
 
@@ -695,7 +702,8 @@ function setOrbState(state, customLabel) {
 // Transcript Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 function appendTranscript(sender, text, timestamp) {
-    elEmptyMsg.classList.add("hidden");
+    if (!elTranscriptScroll) return;
+    if (elEmptyMsg) elEmptyMsg.classList.add("hidden");
 
     const isUser = sender === "user";
     const div = document.createElement("div");
@@ -726,7 +734,11 @@ function appendTranscript(sender, text, timestamp) {
 }
 
 function appendSystemMessage(text) {
-    elEmptyMsg.classList.add("hidden");
+    if (!elTranscriptScroll) {
+        console.info(`[System] ${text}`);
+        return;
+    }
+    if (elEmptyMsg) elEmptyMsg.classList.add("hidden");
 
     const div = document.createElement("div");
     div.className = "system-msg";
@@ -880,11 +892,12 @@ function formatTime(secs) {
 }
 
 function switchTab(tab) {
+    if (!elTabTranscript || !elTabSummary) return;
     const isTranscript = tab === "transcript";
     elTabTranscript.classList.toggle("active", isTranscript);
     elTabSummary.classList.toggle("active", !isTranscript);
-    elTranscriptContent.classList.toggle("hidden", !isTranscript);
-    elSummaryContent.classList.toggle("hidden", isTranscript);
+    if (elTranscriptContent) elTranscriptContent.classList.toggle("hidden", !isTranscript);
+    if (elSummaryContent) elSummaryContent.classList.toggle("hidden", isTranscript);
 }
 
 function escapeHtml(str) {

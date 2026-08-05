@@ -260,136 +260,31 @@ async def get_session_summary(session_id: str):
     end = meta.get("end_time") or time.time()
     duration = int(end - start) if start else 0
 
-    # Retrieve transcript
-    exchanges = meta.get("transcript", [])
-    transcript_str = "\n".join([f"{'Customer' if msg['sender'] == 'user' else 'Agent'}: {msg['text']}" for msg in exchanges])
-
     voice_used = meta.get("voice_profile").name if meta.get("voice_profile") else "Sophia"
     language = meta.get("language", "English")
     industry = meta.get("industry", "hospital")
-
-    # High quality fallback
-    fallback_extracted = {
-        "first_name": "Vaibhav",
-        "last_name": "",
-    }
-    if industry == "hospital":
-        fallback_extracted.update({
-            "appointment_date": "tomorrow",
-            "appointment_time": "11:00 AM",
-            "doctor_name": "Dr. Sharma"
-        })
-    else:
-        fallback_extracted.update({
-            "property_interest": "3 BHK Apartment",
-            "budget": "80 Lakhs",
-            "location": "Hyderabad"
-        })
-
-    if not exchanges:
-        return SummaryOut(
-            summary="The conversation was empty.",
-            intent="None",
-            sentiment="Neutral",
-            duration_seconds=duration,
-            extracted_information={},
-            lead_qualification="Not Applicable",
-            appointment_status="None",
-            knowledge_retrieved=[],
-            recommended_next_action="No action needed.",
-            transcript=[],
-            language=language,
-            voice_used=voice_used,
-            industry=industry,
-            lead_score=0,
-            site_visit_status="None",
-            extracted_variables={}
-        )
-
-    # Invoke LLM to perform structural summarization
-    prompt = f"""
-You are an expert conversational analyst. Analyze the following conversation transcript between our AI voice agent and a customer.
-Generate a JSON output summarizing the call metrics and intent details. Do not return any introductory or trailing text. ONLY return the valid JSON block.
-
-TRANSCRIPT:
-{transcript_str}
-
-JSON SCHEMA:
-{{
-  "summary": "Brief 1-2 sentence summary of the call",
-  "intent": "Primary customer intent (e.g., confirm appointment, reschedule, inquire about price, generic query)",
-  "sentiment": "Overall customer sentiment (Positive, Neutral, Negative, Frustrated)",
-  "lead_score": 85, // An integer between 0 and 100 representing user interest/qualification
-  "appointment_status": "Confirmed / Rescheduled / Cancelled / None",
-  "site_visit_status": "Scheduled / Requested / Declined / None",
-  "extracted_variables": {{
-     "first_name": "Customer first name if found",
-     "last_name": "Customer last name if found",
-     "phone_number": "Phone number if found",
-     "appointment_date": "Date if scheduled/mentioned",
-     "appointment_time": "Time if scheduled/mentioned",
-     "budget": "Budget if mentioned",
-     "property_interest": "Property of interest if mentioned"
-  }},
-  "knowledge_retrieved": ["list of specific facts or policies discussed/retrieved from RAG"],
-  "recommended_next_action": "Recommended next action for sales/support team"
-}}
-"""
-    llm = LLMService()
-    import time as _time
-    summary_data = {}
-    _summary_start = _time.perf_counter()
-    try:
-        content, _ = await llm.generate_completion([{"role": "user", "content": prompt}], tools=None)
-        # Robustly extract JSON block from text response
-        match = re.search(r"(\{.*\})", content, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-        else:
-            json_str = content
-        summary_data = json.loads(json_str.strip())
-    except Exception as e:
-        logger.error(f"[SUMMARY] LLM summarization failed: {e}")
-        summary_data = {
-            "summary": f"Completed {industry} voice calling demo session with {voice_used}.",
-            "intent": "Confirm details" if industry == "hospital" else "Inquire about property",
-            "sentiment": "Positive",
-            "lead_score": 85 if industry == "real_estate" else 90,
-            "appointment_status": "Confirmed" if industry == "hospital" else "None",
-            "site_visit_status": "None" if industry == "hospital" else "Scheduled",
-            "extracted_variables": fallback_extracted,
-            "knowledge_retrieved": ["CityCare parking policy" if industry == "hospital" else "Skyline Developers brochure"],
-            "recommended_next_action": "Verify appointment in calendar." if industry == "hospital" else "Assign sales rep for property tour."
-        }
-    finally:
-        _summary_latency = _time.perf_counter() - _summary_start
-        logger.info(f"[METRICS] Summary LLM Latency: {_summary_latency:.3f}s")
-
-    extracted_vars = summary_data.get("extracted_variables", summary_data.get("extracted_information", {}))
-    if not isinstance(extracted_vars, dict):
-        extracted_vars = fallback_extracted
 
     failure_reason = meta.get("failure_reason")
     error_stack = meta.get("error_stack")
     current_state = meta.get("current_state", "COMPLETED" if not failure_reason else "FAILED")
 
     return SummaryOut(
-        summary=summary_data.get("summary", ""),
-        intent=summary_data.get("intent", ""),
-        sentiment=summary_data.get("sentiment", ""),
+        summary="Call summary and transcripts are disabled for performance optimization.",
+        intent="None",
+        sentiment="Neutral",
         duration_seconds=duration,
-        extracted_information=extracted_vars,
-        lead_qualification="Hot" if summary_data.get("lead_score", 0) > 75 else "Warm",
-        appointment_status=summary_data.get("appointment_status", "None"),
-        knowledge_retrieved=summary_data.get("knowledge_retrieved", []),
-        recommended_next_action=summary_data.get("recommended_next_action", ""),
-        transcript=exchanges,
+        extracted_information={},
+        lead_qualification="Not Applicable",
+        appointment_status="None",
+        knowledge_retrieved=[],
+        recommended_next_action="None",
+        transcript=[],
         language=language,
         voice_used=voice_used,
         industry=industry,
-        lead_score=summary_data.get("lead_score", 85),
-        site_visit_status=summary_data.get("site_visit_status", "None"),
-        extracted_variables=extracted_vars,
+        lead_score=0,
+        site_visit_status="None",
+        extracted_variables={},
         session_id=session_id,
         current_state=current_state,
         failure_reason=failure_reason,
@@ -622,24 +517,6 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
                             logger.info(f"[DEMO-WS] User Transcript: '{transcript}'")
                             
-                            # Send live user transcript event
-                            try:
-                                await websocket.send_json({
-                                    "event": "transcript",
-                                    "sender": "user",
-                                    "text": transcript,
-                                    "timestamp": datetime.utcnow().isoformat()
-                                })
-                            except Exception:
-                                pass
-                            
-                            # Save in transcript
-                            meta["transcript"].append({
-                                "sender": "user",
-                                "text": transcript,
-                                "timestamp": datetime.utcnow().isoformat()
-                            })
-
                             # Run pipeline
                             await _run_pipeline(
                                 call_uuid=session_id,
@@ -792,25 +669,6 @@ async def _run_pipeline(
         else:
             await sm.transition(CallState.WAITING_FOR_CUSTOMER)
         return
-
-    # Send transcript event
-    try:
-        await websocket.send_json({
-            "event": "transcript",
-            "sender": "agent",
-            "text": response_text,
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception:
-        pass
-
-    # Save to session meta
-    if session_meta:
-        session_meta["transcript"].append({
-            "sender": "agent",
-            "text": response_text,
-            "timestamp": datetime.utcnow().isoformat()
-        })
 
     # 2. Transition to GENERATING_RESPONSE
     if state_callback:
