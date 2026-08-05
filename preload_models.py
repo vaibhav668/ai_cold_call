@@ -8,6 +8,14 @@ os.environ["TRANSFORMERS_CACHE"] = "/app/models/hf_cache"
 os.environ["XDG_CACHE_HOME"] = "/app/models/xdg_cache"
 os.environ["TORCH_HOME"] = "/app/models/torch_cache"
 
+# Monkey-patch missing transformers symbol if sentence-transformers requires it
+try:
+    import transformers
+    if not hasattr(transformers, "is_torch_npu_available"):
+        setattr(transformers, "is_torch_npu_available", lambda: False)
+except Exception:
+    pass
+
 print("Pre-downloading models to bake them into the Docker image...", flush=True)
 
 # 1. Preload Whisper STT models

@@ -23,7 +23,7 @@ from app.services.call_state_machine import CallStateMachine, CallState
 from app.core.logging import logger
 from app.models.campaign import Campaign
 from app.models.customer import Customer
-from app.main import STARTUP_METRICS
+from app.core.telemetry import STARTUP_METRICS
 
 router = APIRouter()
 

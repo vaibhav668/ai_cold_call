@@ -11,21 +11,11 @@ from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.logging import logger, setup_logging
 from app.core.middleware import RequestLoggingMiddleware
+from app.core.telemetry import STARTUP_METRICS
 from app.db.chroma import chroma_manager
 
 # Configure logging at startup
 setup_logging()
-
-# Global startup telemetry metrics dictionary
-STARTUP_METRICS: Dict[str, Any] = {
-    "boot_time_sec": 0.0,
-    "vad_load_ms": 0.0,
-    "stt_load_ms": 0.0,
-    "tts_load_ms": 0.0,
-    "llm_warmup_ms": 0.0,
-    "total_warmup_ms": 0.0,
-    "rss_mb": 0.0
-}
 
 
 @asynccontextmanager
