@@ -23,7 +23,7 @@ from app.services.call_state_machine import CallStateMachine, CallState
 from app.core.logging import logger
 from app.models.campaign import Campaign
 from app.models.customer import Customer
-from app.services.llm_service import LLMService
+from app.main import STARTUP_METRICS
 
 router = APIRouter()
 
@@ -73,7 +73,6 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
     Automatically resolves corresponding Campaign & Customer, and performs
     voice-to-language adaptation if needed.
     """
-    # 1. Resolve Voice Profile
     repo = VoiceProfileRepository(db)
     selected_voice = await repo.get(setup.voice_profile_id)
     if not selected_voice or selected_voice.status != "active":
@@ -82,20 +81,17 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
     resolved_voice = selected_voice
     supported_langs = [l.strip() for l in selected_voice.supported_languages.split(",")]
 
-    # Adaptive Voice Switching: If voice does not support requested language, switch to closest compatible
     if setup.language not in supported_langs:
         logger.info(f"[VOICE ADAPT] Selected voice {selected_voice.name} does not support {setup.language}. Finding compatible voice...")
         all_voices = await repo.get_active()
         compatible_voice = None
 
-        # 1. Try matching by gender and target language
         for v in all_voices:
             v_langs = [l.strip() for l in v.supported_languages.split(",")]
             if v.gender == selected_voice.gender and setup.language in v_langs:
                 compatible_voice = v
                 break
 
-        # 2. Try matching by target language only
         if not compatible_voice:
             for v in all_voices:
                 v_langs = [l.strip() for l in v.supported_languages.split(",")]
@@ -109,7 +105,6 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
         else:
             logger.warning(f"[VOICE ADAPT] No compatible voice found for language {setup.language}. Keeping {selected_voice.name}.")
 
-    # 2. Resolve Campaign ID by industry
     camp_query = select(Campaign).where(Campaign.workflow_type == setup.industry, Campaign.is_active == True)
     camp_res = await db.execute(camp_query)
     campaign = camp_res.scalars().first()
@@ -121,14 +116,11 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
         if not campaign:
             raise HTTPException(status_code=404, detail=f"No campaign configured for industry '{setup.industry}'.")
 
-    # 3. Resolve, Create or Update Customer
     cust_query = select(Customer).where(Customer.phone_number == "+15551234567")
     cust_res = await db.execute(cust_query)
     customer = cust_res.scalars().first()
 
-    custom_vars = {
-        "preferred_language": setup.language,
-    }
+    custom_vars = {"preferred_language": setup.language}
     if setup.industry == "hospital":
         custom_vars.update({
             "doctor_name": "Dr. Sharma",
@@ -171,11 +163,9 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
     await db.flush()
     await db.commit()
 
-    # 4. Initialize session configuration
     session_id = str(uuid.uuid4())
     voice_config_dict = json.loads(resolved_voice.voice_configuration or "{}")
 
-    # Update in SessionManager for engine availability
     sm_manager = SessionManager()
     await sm_manager.update_session_metadata(session_id, {
         "session_id": session_id,
@@ -209,12 +199,11 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
 
 @router.api_route("/summary/{session_id}", methods=["GET", "POST"], response_model=SummaryOut)
 async def get_session_summary(session_id: str):
-    """Return lightweight session metadata — transcript/summary generation is disabled for performance."""
+    """Return session metadata and status information."""
     meta = _demo_sessions.get(session_id)
     if not meta:
-        logger.warning(f"[SUMMARY] Session ID '{session_id}' not found in memory. Returning fallback summary.")
         return SummaryOut(
-            summary="The conversation session metadata was lost or the server restarted.",
+            summary="Session metadata lost or process restarted.",
             intent="None",
             sentiment="Neutral",
             duration_seconds=0,
@@ -232,7 +221,7 @@ async def get_session_summary(session_id: str):
             extracted_variables={},
             session_id=session_id,
             current_state="UNKNOWN (Session lost)",
-            failure_reason="Session ID not found in server memory (process restart or invalid session)",
+            failure_reason="Session ID not found in memory",
             error_stack=None
         )
 
@@ -248,7 +237,7 @@ async def get_session_summary(session_id: str):
     current_state = meta.get("current_state", "COMPLETED" if not failure_reason else "FAILED")
 
     return SummaryOut(
-        summary="Call summary and transcripts are disabled for performance optimization.",
+        summary="Call session complete.",
         intent="None",
         sentiment="Neutral",
         duration_seconds=duration,
@@ -272,10 +261,7 @@ async def get_session_summary(session_id: str):
 
 
 async def _safe_cancel_task(task: asyncio.Task, timeout: float = 2.0) -> None:
-    """
-    Safely cancel an asyncio Task and wait for it to finish.
-    Uses asyncio.wait_for instead of asyncio.shield to avoid the shield/cancel deadlock.
-    """
+    """Safely cancel an asyncio Task and wait for it to finish."""
     if task is None or task.done():
         return
     task.cancel()
@@ -286,13 +272,12 @@ async def _safe_cancel_task(task: asyncio.Task, timeout: float = 2.0) -> None:
 @router.websocket("/stream/{session_id}")
 async def voice_agent_websocket(websocket: WebSocket, session_id: str):
     """
-    Bidirectional WebSocket for browser streaming.
-    Accepts raw audio, handles VAD detection, triggers Conversation Engine,
-    and streams TTS synthesized audio back.
+    Bidirectional WebSocket for browser voice agent.
+    Streams continuous audio, performs streaming STT during user speech,
+    runs Progressive LLM → Sentence TTS pipeline, and transmits detailed telemetry.
     """
     await websocket.accept()
     logger.info(f"[DEMO-WS] Connected session: {session_id}")
-    logger.info("[AUDIO-CODEC] WebSocket established. Browser input: 16-bit linear PCM, 8kHz downsampled. Server output: 8-bit G.711 mu-law, 8kHz mono (20ms frames, 160 bytes each).")
 
     meta = _demo_sessions.get(session_id)
     if not meta:
@@ -302,29 +287,39 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
     meta["start_time"] = time.time()
 
+    # Transmit startup telemetry to client upon connection
+    try:
+        await websocket.send_json({
+            "event": "startup_metrics",
+            "metrics": STARTUP_METRICS
+        })
+    except Exception:
+        pass
+
     campaign_id = uuid.UUID(str(meta["campaign_id"]))
     customer_id = uuid.UUID(str(meta["customer_id"]))
     language = meta["language"]
     voice_config = meta.get("voice_config", {})
     language_code = {"English": "en", "Hindi": "hi", "Telugu": "te"}.get(language, "en")
 
-    # Shared active state
     sm = CallStateMachine(session_id)
     audio_queue: asyncio.Queue = asyncio.Queue()
     llm_lock = asyncio.Lock()
-
-    # cancel_event: set when current TTS stream must abort (barge-in or new pipeline)
     cancel_event = asyncio.Event()
 
     utterance_buffer = bytearray()
+    last_intermediate_stt_len = 0
+    intermediate_stt_task: Optional[asyncio.Task] = None
+
     vad = EndOfSpeechDetector()
     stt = SpeechService()
 
     pipeline_task: Optional[asyncio.Task] = None
-    # Monotonically increasing nonce: pipeline only sends audio if its nonce matches current
     _pipeline_nonce = 0
-
     loop = asyncio.get_event_loop()
+
+    # VAD timing tracker
+    vad_timings = []
 
     async def _send_state_change(new_state: CallState) -> None:
         """Transition the call state machine and notify the browser of the state change."""
@@ -339,39 +334,31 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
     async def _barge_in() -> None:
         """Stop current AI speech immediately and transition to customer speaking."""
-        nonlocal pipeline_task, _pipeline_nonce, cancel_event
+        nonlocal pipeline_task, _pipeline_nonce, cancel_event, intermediate_stt_task
         logger.info(f"[BARGE-IN] Customer interrupted AI speech for session {session_id}")
 
-        # 1. Advance nonce — any running pipeline will self-cancel when it checks
         _pipeline_nonce += 1
-
-        # 2. Signal the TTS stream to stop
         cancel_event.set()
-
-        # 3. Flush the audio send queue with a sentinel
         audio_queue.put_nowait(_STOP_SENTINEL)
-
-        # 4. Reset VAD state
         vad.reset()
         utterance_buffer.clear()
 
-        # 5. Cancel the pipeline task
+        await _safe_cancel_task(intermediate_stt_task)
+        intermediate_stt_task = None
+
         await _safe_cancel_task(pipeline_task)
         pipeline_task = None
 
-        # 6. Transition state
         await _send_state_change(CallState.CUSTOMER_SPEAKING)
 
-    async def _fire_pipeline(user_text: str) -> None:
-        """Launch a new pipeline task with the current nonce."""
+    async def _fire_pipeline(user_text: str, user_speech_end_t: float = 0.0) -> None:
+        """Launch a new progressive streaming pipeline task with the current nonce."""
         nonlocal pipeline_task, _pipeline_nonce, cancel_event
 
-        # Advance nonce and reset cancel_event BEFORE starting pipeline
         _pipeline_nonce += 1
         my_nonce = _pipeline_nonce
         cancel_event.clear()
 
-        # Cancel any existing pipeline
         await _safe_cancel_task(pipeline_task)
 
         pipeline_task = asyncio.create_task(
@@ -391,6 +378,8 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 state_callback=_send_state_change,
                 nonce=my_nonce,
                 get_nonce=lambda: _pipeline_nonce,
+                user_speech_end_t=user_speech_end_t,
+                vad_timings=vad_timings,
             )
         )
 
@@ -402,7 +391,6 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 item = await audio_queue.get()
 
                 if item is _STOP_SENTINEL:
-                    # Drain remaining stale audio chunks from queue
                     drained = 0
                     while not audio_queue.empty():
                         try:
@@ -410,9 +398,6 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                             drained += 1
                         except asyncio.QueueEmpty:
                             break
-                    if drained:
-                        logger.info(f"[WS-SEND] Barge-in: drained {drained} stale audio chunks.")
-                    # Notify client to clear its playback buffer immediately
                     try:
                         await websocket.send_json({"event": "clear_audio"})
                     except Exception:
@@ -425,23 +410,18 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 try:
                     await websocket.send_bytes(item)
                     chunks_sent += 1
-                    if chunks_sent % 50 == 0:
-                        logger.info(f"[WS-SEND] Streamed {chunks_sent} audio chunks to browser.")
                 except Exception as e:
                     logger.error(f"[WS-SEND] Connection lost during audio stream: {e}")
                     break
-                # No artificial sleep — WebSocket backpressure handles flow control naturally
 
         except Exception as e:
             logger.error(f"[WS-SEND] Send loop error: {e}")
-        logger.info(f"[WS-SEND] Stream loop terminated. Total chunks sent: {chunks_sent}")
 
     send_task = asyncio.create_task(_send_loop())
 
     # ── Main receive loop ────────────────────────────────────────────────────
     try:
-        # Fire initial warm greeting
-        logger.info(f"[DEMO-WS] Firing greeting for session {session_id}")
+        logger.info(f"[DEMO-WS] Firing sub-second greeting pipeline for session {session_id}")
         await _fire_pipeline("[CALL_START]")
 
         while not sm.is_terminal():
@@ -451,7 +431,6 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 logger.info(f"[DEMO-WS] Browser disconnected for session {session_id}")
                 break
 
-            # ── Control messages (JSON) ──────────────────────────────────────
             if "text" in data:
                 try:
                     msg = json.loads(data["text"])
@@ -464,27 +443,27 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 except Exception:
                     pass
 
-            # ── Binary audio stream ──────────────────────────────────────────
             elif "bytes" in data:
                 binary_data = data["bytes"]
-
-                # Transcode Int16 PCM → G.711 mu-law (half the bytes)
                 mu_law_audio = pcm16_to_ulaw(binary_data)
 
-                # ── VAD during AI speech: barge-in detection ─────────────────
+                # Measure VAD latency
+                v_start = time.perf_counter()
+
+                # VAD during AI speech: barge-in detection
                 if sm.is_ai_speaking():
                     loop_time = loop.time()
-                    # Skip barge-in checks for the first 1.2s to avoid echo detection
                     if loop_time - sm.ai_speech_start_time > 1.2:
-                        # VAD is CPU-bound (Silero Torch): run in executor, non-blocking
                         vad_event = await loop.run_in_executor(None, vad.process_frame, mu_law_audio)
+                        v_elapsed = (time.perf_counter() - v_start) * 1000.0
+                        vad_timings.append(v_elapsed)
+
                         if vad_event == "speech_start":
                             await _barge_in()
                     else:
                         vad.reset()
                     continue
 
-                # ── Skip frames during processing states ─────────────────────
                 if sm.state in (
                     CallState.TRANSCRIBING,
                     CallState.THINKING,
@@ -494,22 +473,45 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 ):
                     continue
 
-                # ── Ignore audio during the echo blanking window ─────────────
                 loop_time = loop.time()
                 if sm.is_waiting() and (loop_time - sm.waiting_start_time < 0.6):
                     vad.reset()
                     continue
 
-                # ── Normal VAD processing (executor — non-blocking) ──────────
+                # Normal VAD processing
                 vad_event = await loop.run_in_executor(None, vad.process_frame, mu_law_audio)
+                v_elapsed = (time.perf_counter() - v_start) * 1000.0
+                vad_timings.append(v_elapsed)
 
                 if sm.state == CallState.CUSTOMER_SPEAKING:
                     utterance_buffer.extend(mu_law_audio)
+
+                    # Streaming STT: periodically run intermediate transcription every 8000 bytes (~1.0s audio)
+                    if len(utterance_buffer) - last_intermediate_stt_len >= 8000:
+                        last_intermediate_stt_len = len(utterance_buffer)
+
+                        async def _run_intermediate_stt(audio_snapshot: bytes):
+                            try:
+                                inter_transcript = await stt.transcribe_utterance(audio_snapshot, language=language_code)
+                                if inter_transcript:
+                                    await websocket.send_json({
+                                        "event": "transcript",
+                                        "sender": "user",
+                                        "text": inter_transcript,
+                                        "intermediate": True
+                                    })
+                            except Exception:
+                                pass
+
+                        # Launch intermediate STT in background without blocking
+                        if intermediate_stt_task is None or intermediate_stt_task.done():
+                            intermediate_stt_task = asyncio.create_task(_run_intermediate_stt(bytes(utterance_buffer)))
 
                 if vad_event == "speech_start":
                     if sm.is_waiting():
                         logger.info(f"[DEMO-WS] Speech start detected for session {session_id}")
                         utterance_buffer.clear()
+                        last_intermediate_stt_len = 0
                         vad.reset()
                         vad.provider._in_speech = True
                         if hasattr(vad.provider, '_speech_confirmed'):
@@ -518,43 +520,55 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
                 elif vad_event == "speech_end":
                     if sm.state == CallState.CUSTOMER_SPEAKING:
+                        user_speech_end_t = time.perf_counter()
                         logger.info(f"[DEMO-WS] Speech end detected — firing STT for session {session_id}")
                         await _send_state_change(CallState.TRANSCRIBING)
 
                         utterance_bytes = bytes(utterance_buffer)
                         utterance_buffer.clear()
+                        last_intermediate_stt_len = 0
                         vad.reset()
 
-                        async def _transcribe_and_run(audio: bytes) -> None:
-                            import time as _time
-                            _stt_start = _time.perf_counter()
+                        await _safe_cancel_task(intermediate_stt_task)
+                        intermediate_stt_task = None
+
+                        async def _transcribe_and_run(audio: bytes, speech_end_t: float) -> None:
+                            _stt_start = time.perf_counter()
                             transcript = await stt.transcribe_utterance(audio, language=language_code)
-                            _stt_latency = _time.perf_counter() - _stt_start
-                            logger.info(f"[METRICS] STT Latency: {_stt_latency:.3f}s | audio_len={len(audio)} bytes")
+                            stt_latency_ms = (time.perf_counter() - _stt_start) * 1000.0
 
                             if not transcript:
                                 logger.info(f"[DEMO-WS] Empty transcript. Returning to WAITING.")
                                 await _send_state_change(CallState.WAITING_FOR_CUSTOMER)
                                 return
 
-                            logger.info(f"[DEMO-WS] User Transcript: '{transcript}'")
-                            await _fire_pipeline(transcript)
+                            logger.info(f"[METRICS] STT Latency: {stt_latency_ms:.1f}ms | Transcript: '{transcript}'")
 
-                        # Cancel any previous pipeline before starting STT→pipeline chain
+                            # Send final user transcript to browser
+                            try:
+                                await websocket.send_json({
+                                    "event": "transcript",
+                                    "sender": "user",
+                                    "text": transcript,
+                                    "intermediate": False
+                                })
+                            except Exception:
+                                pass
+
+                            await _fire_pipeline(transcript, user_speech_end_t=speech_end_t)
+
                         await _safe_cancel_task(pipeline_task)
-                        pipeline_task = asyncio.create_task(_transcribe_and_run(utterance_bytes))
+                        pipeline_task = asyncio.create_task(_transcribe_and_run(utterance_bytes, user_speech_end_t))
 
     except WebSocketDisconnect as e:
         logger.info(f"[DEMO-WS] WebSocket disconnect event for session {session_id} (code={e.code}, reason={e.reason or 'None'})")
-        if e.code == 1006:
-            logger.warning(f"[DEMO-WS] Code 1006: abnormal closure — likely OOM crash, network timeout, or Render 30s idle timeout.")
         if meta:
             meta["failure_reason"] = f"WebSocket disconnected: code={e.code}, reason={e.reason or 'None'}"
             meta["current_state"] = sm.state.name
     except Exception as e:
         import traceback
         stack = traceback.format_exc()
-        logger.error(f"[DEMO-WS] WebSocket exception for session {session_id} in state {sm.state.name}: {e}", exc_info=True)
+        logger.error(f"[DEMO-WS] WebSocket exception for session {session_id}: {e}", exc_info=True)
         if meta:
             meta["failure_reason"] = f"WebSocket exception: {e}"
             meta["current_state"] = sm.state.name
@@ -563,47 +577,25 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
         meta["end_time"] = time.time()
         logger.info(f"[DEMO-WS] Cleaning up session {session_id}")
 
-        # Signal all running pipelines to stop
         cancel_event.set()
-
-        # Cancel pipeline task
+        await _safe_cancel_task(intermediate_stt_task)
         await _safe_cancel_task(pipeline_task)
 
-        # Flush audio queue
         audio_queue.put_nowait(None)
         while not audio_queue.empty():
             with contextlib.suppress(asyncio.QueueEmpty):
                 audio_queue.get_nowait()
 
-        # Stop send loop
         send_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await asyncio.wait_for(send_task, timeout=2.0)
 
-        # Close WebSocket cleanly
         with contextlib.suppress(Exception):
             await websocket.close()
 
-        # Clear utterance buffer
         utterance_buffer.clear()
-
-        # Clear session state from session manager
         with contextlib.suppress(Exception):
             await SessionManager().clear_session(session_id)
-
-        import gc
-        gc.collect()
-        with contextlib.suppress(ImportError):
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        try:
-            import psutil
-            rss = psutil.Process().memory_info().rss / (1024 * 1024)
-            logger.info(f"[MEMORY] Session {session_id} cleaned. Current RSS: {rss:.2f} MB")
-        except Exception:
-            pass
 
 
 async def _run_pipeline(
@@ -622,138 +614,151 @@ async def _run_pipeline(
     state_callback=None,
     nonce: int = 0,
     get_nonce=None,
+    user_speech_end_t: float = 0.0,
+    vad_timings: Optional[List[float]] = None,
 ) -> None:
     """
-    Core turn-taking pipeline: ConversationEngine → TTS synthesis → audio queue.
-
-    nonce/get_nonce: Pipeline self-cancels if a newer pipeline has started (barge-in safety).
+    End-to-End Progressive Pipeline:
+    Stream LLM Tokens → Sentence Splitter → Progressive TTS Synthesis → Client Audio Queue
+    Calculates detailed telemetry metrics and pushes them to the browser.
     """
-    import time as _time
-    _pipeline_start = _time.perf_counter()
-    logger.info(f"[DEMO-PIPELINE] Pipeline started for {call_uuid} | nonce={nonce} | user_text='{user_text[:60]}'")
+    _pipeline_start = time.perf_counter()
 
     def _is_superseded() -> bool:
-        """Returns True if a newer pipeline has started — this one should abort."""
         return get_nonce is not None and get_nonce() != nonce
 
-    # 1. Transition to THINKING
     if state_callback:
         await state_callback(CallState.THINKING)
-    else:
-        await sm.transition(CallState.THINKING)
 
     if _is_superseded():
-        logger.info(f"[DEMO-PIPELINE] Pipeline nonce={nonce} superseded before LLM. Aborting.")
         return
 
-    response_text = ""
     should_hangup = False
+    should_transfer = False
+    llm_first_token_ms = 0.0
+    tts_first_byte_ms = 0.0
+    total_round_trip_ms = 0.0
+    chunks_count = 0
+    full_agent_response = []
 
-    _llm_start = _time.perf_counter()
+    _llm_start = time.perf_counter()
+
     async with llm_lock:
         if _is_superseded():
-            logger.info(f"[DEMO-PIPELINE] Pipeline nonce={nonce} superseded while waiting for LLM lock. Aborting.")
             return
+
         try:
             async for db in get_db_session():
                 engine = ConversationEngine(db)
-                response_text, should_hangup, _ = await engine.process_turn(
+                tts = VoiceService()
+
+                # Stream LLM token generator
+                token_stream = engine.process_turn_stream(
                     call_id=call_uuid,
                     campaign_id=campaign_id,
                     customer_id=customer_id,
                     user_text=user_text
                 )
+
+                # Generator yielding raw text chunks for TTS
+                async def _text_chunk_extractor():
+                    nonlocal llm_first_token_ms, should_hangup, should_transfer
+                    async for chunk, h, tr in token_stream:
+                        if _is_superseded() or cancel_event.is_set():
+                            break
+                        if h:
+                            should_hangup = True
+                        if tr:
+                            should_transfer = True
+                        if chunk:
+                            if llm_first_token_ms == 0.0:
+                                llm_first_token_ms = (time.perf_counter() - _llm_start) * 1000.0
+                            full_agent_response.append(chunk)
+                            yield chunk
+
+                # Pass text generator into progressive sentence-level TTS streamer
+                _tts_start = time.perf_counter()
+                audio_stream = tts.stream_text_stream_progressive(
+                    _text_chunk_extractor(),
+                    cancel_event=cancel_event,
+                    language=language_code,
+                    voice_config=voice_config
+                )
+
+                # Transition state to GENERATING_RESPONSE / AI_SPEAKING as soon as audio starts
+                if state_callback:
+                    await state_callback(CallState.GENERATING_RESPONSE)
+
+                first_chunk_sent = False
+
+                async for audio_chunk in audio_stream:
+                    if _is_superseded() or cancel_event.is_set():
+                        break
+
+                    if not first_chunk_sent:
+                        first_chunk_sent = True
+                        tts_first_byte_ms = (time.perf_counter() - _tts_start) * 1000.0
+                        if user_speech_end_t > 0.0:
+                            total_round_trip_ms = (time.perf_counter() - user_speech_end_t) * 1000.0
+                        else:
+                            total_round_trip_ms = (time.perf_counter() - _pipeline_start) * 1000.0
+
+                        if state_callback:
+                            await state_callback(CallState.AI_SPEAKING)
+
+                        # Transmit real-time telemetry metrics to browser
+                        avg_vad_ms = round(sum(vad_timings) / len(vad_timings), 2) if vad_timings else 0.0
+                        try:
+                            if websocket:
+                                await websocket.send_json({
+                                    "event": "metrics",
+                                    "metrics": {
+                                        "llm_latency_ms": round(llm_first_token_ms, 1),
+                                        "tts_first_byte_ms": round(tts_first_byte_ms, 1),
+                                        "total_round_trip_ms": round(total_round_trip_ms, 1),
+                                        "vad_latency_ms": avg_vad_ms,
+                                    }
+                                })
+                        except Exception:
+                            pass
+
+                        logger.info(
+                            f"[TELEMETRY] Round-Trip={total_round_trip_ms:.1f}ms | "
+                            f"LLM TTFT={llm_first_token_ms:.1f}ms | TTS TTFB={tts_first_byte_ms:.1f}ms | VAD avg={avg_vad_ms}ms"
+                        )
+
+                    await audio_queue.put(audio_chunk)
+                    chunks_count += 1
+
                 break
+
         except asyncio.CancelledError:
-            logger.info(f"[DEMO-PIPELINE] LLM call cancelled for nonce={nonce}")
             raise
         except Exception as e:
-            logger.error(f"[DEMO-PIPELINE] Engine execution failed: {e}")
-            response_text = "I am having trouble connecting right now. Could you repeat that?"
+            import traceback
+            stack = traceback.format_exc()
+            logger.error(f"[DEMO-PIPELINE] Pipeline error: {e}\n{stack}")
 
-    _llm_latency = _time.perf_counter() - _llm_start
-    logger.info(f"[METRICS] LLM+DB Latency: {_llm_latency:.3f}s | response_len={len(response_text)} chars")
+    _pipeline_total = (time.perf_counter() - _pipeline_start) * 1000.0
+    full_text_str = "".join(full_agent_response).strip()
 
-    if _is_superseded() or cancel_event.is_set():
-        logger.info(f"[DEMO-PIPELINE] Pipeline nonce={nonce} superseded after LLM. Aborting.")
-        return
+    if full_text_str and websocket:
+        try:
+            await websocket.send_json({
+                "event": "transcript",
+                "sender": "agent",
+                "text": full_text_str,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        except Exception:
+            pass
 
-    if not response_text:
-        if state_callback:
-            await state_callback(CallState.WAITING_FOR_CUSTOMER)
-        else:
-            await sm.transition(CallState.WAITING_FOR_CUSTOMER)
-        return
+    logger.info(f"[METRICS] Pipeline Complete: total={_pipeline_total:.1f}ms | chunks={chunks_count}")
 
-    logger.info(f"[DEMO-PIPELINE] Agent Response: '{response_text[:80]}...' (nonce={nonce})")
-
-    # 2. Transition to GENERATING_RESPONSE
-    if state_callback:
-        await state_callback(CallState.GENERATING_RESPONSE)
-    else:
-        await sm.transition(CallState.GENERATING_RESPONSE)
-
-    if _is_superseded() or cancel_event.is_set():
-        return
-
-    # 3. Transition to AI_SPEAKING & stream audio chunks
-    tts = VoiceService()
-
-    if state_callback:
-        await state_callback(CallState.AI_SPEAKING)
-    else:
-        await sm.transition(CallState.AI_SPEAKING)
-
-    try:
-        chunks_count = 0
-        _tts_start = _time.perf_counter()
-        _tts_ttfb = None
-
-        async for audio_chunk in tts.stream_speech(
-            response_text,
-            cancel_event=cancel_event,
-            language=language_code,
-            voice_config=voice_config
-        ):
-            # Abort immediately if superseded by a new pipeline (barge-in)
-            if _is_superseded() or cancel_event.is_set():
-                logger.info(f"[DEMO-PIPELINE] TTS stream interrupted at chunk {chunks_count} (nonce={nonce} superseded).")
-                break
-
-            if _tts_ttfb is None:
-                _tts_ttfb = _time.perf_counter() - _tts_start
-                logger.info(f"[METRICS] TTS TTFB: {_tts_ttfb:.3f}s")
-
-            await audio_queue.put(audio_chunk)
-            chunks_count += 1
-
-        _tts_total = _time.perf_counter() - _tts_start
-        logger.info(f"[METRICS] TTS Total: {_tts_total:.3f}s | chunks={chunks_count} | nonce={nonce}")
-
-    except asyncio.CancelledError:
-        logger.info(f"[DEMO-PIPELINE] TTS cancelled for nonce={nonce}")
-        raise
-    except Exception as e:
-        import traceback
-        stack = traceback.format_exc()
-        logger.error(f"[DEMO-PIPELINE] TTS generation error: {e}")
-        if session_meta:
-            session_meta["failure_reason"] = f"TTS generation error: {e}"
-            session_meta["current_state"] = sm.state.name
-            session_meta["error_stack"] = stack
-
-    _pipeline_total = _time.perf_counter() - _pipeline_start
-    logger.info(f"[METRICS] Pipeline Total: {_pipeline_total:.3f}s | LLM={_llm_latency:.3f}s | nonce={nonce}")
-
-    # Only transition state if this pipeline is still the active one
     if not _is_superseded() and not cancel_event.is_set():
         if should_hangup:
             if state_callback:
                 await state_callback(CallState.CALL_COMPLETED)
-            else:
-                await sm.transition(CallState.CALL_COMPLETED)
         else:
             if state_callback:
                 await state_callback(CallState.WAITING_FOR_CUSTOMER)
-            else:
-                await sm.transition(CallState.WAITING_FOR_CUSTOMER)

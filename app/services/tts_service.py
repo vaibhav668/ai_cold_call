@@ -28,10 +28,8 @@ class VoiceService:
             self.provider = EdgeTTSProvider()
             logger.info("[VoiceService] Using EdgeTTSProvider (Microsoft Edge TTS).")
         else:
-            # Try MeloTTS; if it fails at init time, fall back to EdgeTTS
             try:
                 candidate = MeloTTSProvider()
-                # Quick health check: if the underlying model is a mock, switch to EdgeTTS
                 if getattr(candidate, '_is_mock', False):
                     raise RuntimeError("MeloTTS is in mock mode.")
                 self.provider = candidate
@@ -39,7 +37,6 @@ class VoiceService:
             except Exception as e:
                 logger.warning(f"[VoiceService] MeloTTS unavailable ({e}). Falling back to EdgeTTSProvider.")
                 self.provider = EdgeTTSProvider()
-
 
     async def stream_speech(
         self,
@@ -57,3 +54,65 @@ class VoiceService:
         else:
             async for chunk in self.provider.stream_speech(text, cancel_event=cancel_event, language=language):
                 yield chunk
+
+    async def stream_text_stream_progressive(
+        self,
+        text_stream: AsyncGenerator[str, None],
+        cancel_event: Optional[asyncio.Event] = None,
+        language: Optional[str] = None,
+        voice_config: Optional[dict] = None
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Consumes an incoming LLM token stream, splits into sentences progressively,
+        and synthesizes audio chunks for each sentence immediately.
+        """
+        buffer = ""
+        punctuation = {'.', '?', '!', '\n'}
+        abbreviations = ("dr.", "mr.", "mrs.", "ms.", "vs.", "st.", "co.", "inc.", "ltd.", "e.g.", "i.e.")
+
+        async for chunk in text_stream:
+            if cancel_event and cancel_event.is_set():
+                break
+            buffer += chunk
+
+            while True:
+                first_idx = -1
+                for p in punctuation:
+                    idx = buffer.find(p)
+                    if idx != -1:
+                        if first_idx == -1 or idx < first_idx:
+                            first_idx = idx
+
+                if first_idx == -1:
+                    break
+
+                segment = buffer[:first_idx + 1]
+                low_seg = segment.strip().lower()
+                if any(low_seg.endswith(abbr) for abbr in abbreviations):
+                    break
+
+                sentence = segment.strip()
+                buffer = buffer[first_idx + 1:]
+
+                if sentence:
+                    async for audio_chunk in self.stream_speech(
+                        sentence,
+                        cancel_event=cancel_event,
+                        language=language,
+                        voice_config=voice_config
+                    ):
+                        if cancel_event and cancel_event.is_set():
+                            return
+                        yield audio_chunk
+
+        remaining = buffer.strip()
+        if remaining and (not cancel_event or not cancel_event.is_set()):
+            async for audio_chunk in self.stream_speech(
+                remaining,
+                cancel_event=cancel_event,
+                language=language,
+                voice_config=voice_config
+            ):
+                if cancel_event and cancel_event.is_set():
+                    return
+                yield audio_chunk

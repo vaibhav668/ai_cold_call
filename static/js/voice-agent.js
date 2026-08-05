@@ -2,20 +2,20 @@
  * Voice Agent Demo — Frontend Logic
  *
  * Architecture:
- *   Browser Mic → PCM16 (8kHz) → WebSocket → Backend (VAD/STT/LLM/TTS)
- *   Backend → mu-law frames (8kHz) → WebSocket → Browser playback queue → Speaker
+ *   Browser Mic → PCM16 (8kHz) → WebSocket → Backend (VAD/Streaming STT/Progressive LLM/Progressive TTS)
+ *   Backend → G.711 mu-law (8kHz) → WebSocket → 8kHz Playback Queue → Speaker
  *
- * Key design decisions:
- *  - Separate AudioContexts: 44.1kHz capture context + 8kHz playback context
- *    (eliminates nextPlayTime drift from sample-rate mismatch)
- *  - AudioWorkletNode for capture (off main thread, no frame drops)
- *  - WebSocket keepalive ping every 15s (prevents Render 30s idle disconnect)
- *  - nonce-based clear_audio ensures barge-in drains the playback queue completely
+ * Key features:
+ *  - Sub-second start latency for initial greeting
+ *  - Dedicated 8kHz playback AudioContext (zero audio drift)
+ *  - AudioWorkletNode capture off main thread (ScriptProcessorNode fallback)
+ *  - Live intermediate speech transcription as user speaks
+ *  - Real-time latency metrics dashboard (Round-Trip, LLM, TTS, VAD)
+ *  - 15s WebSocket keepalive ping (prevents Render idle timeout)
  */
 
 "use strict";
 
-// ─── Configuration ────────────────────────────────────────────────────────────
 const RENDER_BACKEND    = "https://ai-cold-call.onrender.com";
 const RENDER_WS_BACKEND = "wss://ai-cold-call.onrender.com";
 
@@ -39,24 +39,24 @@ const WS_BASE  = getWsBase();
 console.log(`[Config] API_BASE="${API_BASE}" WS_BASE="${WS_BASE}"`);
 
 // ─── Global State ─────────────────────────────────────────────────────────────
-let activeVoiceId  = null;
-let activeVoiceObj = null;
-let voices         = [];
-let industries     = [];
-let sessionId      = null;
-let websocket      = null;
-let wsClosedByUs   = false;
+let activeVoiceId   = null;
+let activeVoiceObj  = null;
+let voices          = [];
+let industries      = [];
+let sessionId       = null;
+let websocket       = null;
+let wsClosedByUs    = false;
 let connectionState = "disconnected";
 
 // Timer
-let callTimerInterval    = null;
-let callDurationSeconds  = 0;
+let callTimerInterval   = null;
+let callDurationSeconds = 0;
 
-// Audio — two separate contexts to prevent sample-rate drift
-let captureContext   = null;  // 44100 Hz — for microphone capture
-let playbackContext  = null;  // 8000 Hz  — for mu-law playback (matches server output exactly)
+// Audio
+let captureContext   = null;  // 44100 Hz
+let playbackContext  = null;  // 8000 Hz
 let mediaStream      = null;
-let workletNode      = null;  // AudioWorkletNode (replaces deprecated ScriptProcessorNode)
+let workletNode      = null;
 let activeSources    = [];
 let nextPlayTime     = 0;
 let isMuted          = false;
@@ -72,19 +72,20 @@ let elIndustry, elLanguage, elStartBtn, elEndBtn, elCallMetrics,
     elActiveVoiceName, elActiveVoiceRole, elActiveVoiceDesc,
     elTranscriptScroll, elEmptyMsg, elTypingIndicator,
     elSummaryScroll, elTabTranscript, elTabSummary,
-    elTranscriptContent, elSummaryContent, elWidgetOrb;
+    elTranscriptContent, elSummaryContent, elWidgetOrb,
+    elTelemetryPanel, elTeleRoundtrip, elTeleLlm, elTeleTts;
 
 // ─── CallState Enum ───────────────────────────────────────────────────────────
 const CallState = {
-    CONNECTED:           "CONNECTED",
-    WAITING_FOR_CUSTOMER:"WAITING_FOR_CUSTOMER",
-    CUSTOMER_SPEAKING:   "CUSTOMER_SPEAKING",
-    TRANSCRIBING:        "TRANSCRIBING",
-    THINKING:            "THINKING",
-    GENERATING_RESPONSE: "GENERATING_RESPONSE",
-    AI_SPEAKING:         "AI_SPEAKING",
-    CALL_COMPLETED:      "CALL_COMPLETED",
-    ERROR:               "ERROR"
+    CONNECTED:            "CONNECTED",
+    WAITING_FOR_CUSTOMER: "WAITING_FOR_CUSTOMER",
+    CUSTOMER_SPEAKING:    "CUSTOMER_SPEAKING",
+    TRANSCRIBING:         "TRANSCRIBING",
+    THINKING:             "THINKING",
+    GENERATING_RESPONSE:  "GENERATING_RESPONSE",
+    AI_SPEAKING:          "AI_SPEAKING",
+    CALL_COMPLETED:       "CALL_COMPLETED",
+    ERROR:                "ERROR"
 };
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -114,6 +115,10 @@ document.addEventListener("DOMContentLoaded", () => {
     elTranscriptContent= document.getElementById("transcript-tab-content");
     elSummaryContent   = document.getElementById("summary-tab-content");
     elWidgetOrb        = document.getElementById("widget-orb-click");
+    elTelemetryPanel   = document.getElementById("telemetry-panel");
+    elTeleRoundtrip    = document.getElementById("tele-roundtrip");
+    elTeleLlm          = document.getElementById("tele-llm");
+    elTeleTts          = document.getElementById("tele-tts");
 
     setupListeners();
     loadVoices();
@@ -289,7 +294,6 @@ async function startConversation() {
         return;
     }
 
-    // Unlock AudioContexts on user gesture — required by browsers
     await ensureAudioContexts();
 
     connectionState = "connecting";
@@ -297,6 +301,7 @@ async function startConversation() {
     elStartBtn.classList.add("hidden");
     elEndBtn.classList.remove("hidden");
     elCallMetrics.classList.remove("hidden");
+    if (elTelemetryPanel) elTelemetryPanel.classList.remove("hidden");
     elStatus.textContent = "Setting up…";
     elStatus.className   = "metric-value";
     setOrbState(CallState.CONNECTED, "Setting up…");
@@ -307,7 +312,6 @@ async function startConversation() {
     if (elTabTranscript) switchTab("transcript");
 
     try {
-        // 1. Create backend session
         console.log("[Session] Creating session...");
         const sessionRes = await fetch(`${API_BASE}/api/v1/voice-demo/sessions`, {
             method: "POST",
@@ -333,7 +337,6 @@ async function startConversation() {
             appendSystemMessage(`Voice auto-adapted to ${sessionData.voice_profile.name} (language compatibility)`);
         }
 
-        // 2. Request microphone
         console.log("[Mic] Requesting microphone access...");
         mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -345,7 +348,6 @@ async function startConversation() {
         });
         console.log("[Mic] Access granted.");
 
-        // 3. Open WebSocket
         wsClosedByUs = false;
         const wsUrl = `${WS_BASE}/api/v1/voice-demo/stream/${sessionId}`;
         console.log(`[WS] Connecting to: ${wsUrl}`);
@@ -457,25 +459,20 @@ function resetUIAfterCall() {
 // Audio Context & Capture
 // ─────────────────────────────────────────────────────────────────────────────
 async function ensureAudioContexts() {
-    // Capture context — 44.1kHz for mic capture (browser native)
     if (!captureContext) {
         captureContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
         console.log(`[Audio] Capture AudioContext created (sampleRate=${captureContext.sampleRate})`);
     }
     if (captureContext.state === "suspended") {
         await captureContext.resume();
-        console.log("[Audio] Capture AudioContext resumed.");
     }
 
-    // Playback context — 8000Hz to EXACTLY match server mu-law output
-    // This eliminates nextPlayTime drift completely (no implicit resampling of durations)
     if (!playbackContext) {
         playbackContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
         console.log(`[Audio] Playback AudioContext created (sampleRate=${playbackContext.sampleRate})`);
     }
     if (playbackContext.state === "suspended") {
         await playbackContext.resume();
-        console.log("[Audio] Playback AudioContext resumed.");
     }
 
     audioContextStarted = true;
@@ -486,7 +483,6 @@ async function ensureAudioContexts() {
 async function setupAudioCapture() {
     if (!captureContext || !mediaStream) return;
 
-    // Try AudioWorklet first (non-blocking, runs off main thread)
     try {
         const workletUrl = `${window.location.origin}/static/js/audio-capture-worklet.js`;
         await captureContext.audioWorklet.addModule(workletUrl);
@@ -505,13 +501,11 @@ async function setupAudioCapture() {
         };
 
         sourceNode.connect(workletNode);
-        // workletNode output not connected to destination — capture only, no audio passthrough
         console.log("[Audio] Capture pipeline active (AudioWorkletNode).");
 
     } catch (err) {
         console.warn(`[Audio] AudioWorklet failed (${err.message}), falling back to ScriptProcessorNode.`);
 
-        // Fallback: ScriptProcessorNode (deprecated but widely supported)
         const sourceNode = captureContext.createMediaStreamSource(mediaStream);
         const scriptProcessor = captureContext.createScriptProcessor(4096, 1, 1);
 
@@ -561,22 +555,19 @@ function startKeepalive() {
     pingInterval = setInterval(() => {
         if (websocket && websocket.readyState === WebSocket.OPEN) {
             websocket.send(JSON.stringify({ event: "ping" }));
-            console.debug("[WS] Keepalive ping sent.");
         }
-    }, 15000); // Every 15 seconds — well within Render's 30s idle timeout
-    console.log("[WS] Keepalive started (15s interval).");
+    }, 15000);
 }
 
 function stopKeepalive() {
     if (pingInterval) {
         clearInterval(pingInterval);
         pingInterval = null;
-        console.log("[WS] Keepalive stopped.");
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Audio Playback — 8kHz mu-law decode → Web Audio API
+// Audio Playback
 // ─────────────────────────────────────────────────────────────────────────────
 function decodeUlaw(u) {
     u = (~u) & 0xFF;
@@ -596,8 +587,6 @@ function playMulaw(arrayBuffer) {
     const f32 = new Float32Array(u8.length);
     for (let i = 0; i < u8.length; i++) f32[i] = decodeUlaw(u8[i]);
 
-    // AudioBuffer at 8000 Hz — matches playbackContext.sampleRate exactly
-    // buf.duration = u8.length / 8000.0 — correct with no resampling needed
     const buf = playbackContext.createBuffer(1, f32.length, 8000);
     buf.getChannelData(0).set(f32);
 
@@ -606,10 +595,9 @@ function playMulaw(arrayBuffer) {
     src.connect(playbackContext.destination);
 
     const now = playbackContext.currentTime;
-    // Maintain a jitter buffer: schedule at least 20ms ahead of now
     if (nextPlayTime < now + 0.02) nextPlayTime = now + 0.02;
     src.start(nextPlayTime);
-    nextPlayTime += buf.duration;  // buf.duration is exact at 8kHz — no drift
+    nextPlayTime += buf.duration;
 
     activeSources.push(src);
     src.onended = () => {
@@ -621,12 +609,12 @@ function playMulaw(arrayBuffer) {
 function stopAllAudio() {
     activeSources.forEach(src => { try { src.stop(); } catch (_) {} });
     activeSources = [];
-    nextPlayTime  = 0;  // CRITICAL: reset so next AI response queues from now, not from old future time
+    nextPlayTime  = 0;
     console.log("[Audio] All playback stopped.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Message Handler
+// WebSocket Message Handler & Telemetry
 // ─────────────────────────────────────────────────────────────────────────────
 function handleWsMessage(evt) {
     if (evt.data instanceof ArrayBuffer) {
@@ -635,28 +623,43 @@ function handleWsMessage(evt) {
     }
     try {
         const msg = JSON.parse(evt.data);
-        console.log("[WS] Control:", msg.event, msg);
 
         switch (msg.event) {
             case "state_change":
                 setOrbState(msg.state);
                 break;
             case "clear_audio":
-                // Server confirmed barge-in — stop ALL audio immediately and reset timeline
                 stopAllAudio();
                 break;
             case "transcript":
-                appendTranscript(msg.sender, msg.text, msg.timestamp);
+                appendTranscript(msg.sender, msg.text, msg.timestamp, msg.intermediate);
+                break;
+            case "metrics":
+                updateTelemetryMetrics(msg.metrics);
+                break;
+            case "startup_metrics":
+                console.log("[Startup Telemetry]", msg.metrics);
                 break;
             case "pong":
-                // Server acknowledged our keepalive ping
-                console.debug("[WS] Pong received.");
                 break;
             default:
                 console.warn("[WS] Unknown event:", msg.event);
         }
     } catch (e) {
         console.error("[WS] Failed to parse control message:", e, evt.data);
+    }
+}
+
+function updateTelemetryMetrics(metrics) {
+    if (!metrics) return;
+    if (elTeleRoundtrip && metrics.total_round_trip_ms != null) {
+        elTeleRoundtrip.textContent = `${metrics.total_round_trip_ms} ms`;
+    }
+    if (elTeleLlm && metrics.llm_latency_ms != null) {
+        elTeleLlm.textContent = `${metrics.llm_latency_ms} ms`;
+    }
+    if (elTeleTts && metrics.tts_first_byte_ms != null) {
+        elTeleTts.textContent = `${metrics.tts_first_byte_ms} ms`;
     }
 }
 
@@ -724,14 +727,56 @@ function setOrbState(state, customLabel) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transcript Rendering
+// Transcript Rendering (with Live Intermediate STT support)
 // ─────────────────────────────────────────────────────────────────────────────
-function appendTranscript(sender, text, timestamp) {
+function appendTranscript(sender, text, timestamp, isIntermediate) {
     if (!elTranscriptScroll) return;
     if (elEmptyMsg) elEmptyMsg.classList.add("hidden");
 
     const isUser = sender === "user";
-    const div    = document.createElement("div");
+
+    // Handle intermediate live STT transcript updates
+    if (isUser && isIntermediate) {
+        let interMsg = elTranscriptScroll.querySelector(".dialog-msg.intermediate-user");
+        if (!interMsg) {
+            interMsg = document.createElement("div");
+            interMsg.className = "dialog-msg user intermediate-user";
+
+            const senderEl = document.createElement("span");
+            senderEl.className = "msg-sender";
+            senderEl.textContent = "You (speaking...)";
+
+            const bubble = document.createElement("div");
+            bubble.className = "msg-bubble";
+            bubble.style.opacity = "0.75";
+            bubble.style.fontStyle = "italic";
+
+            const timeEl = document.createElement("span");
+            timeEl.className = "msg-time";
+            timeEl.textContent = "Live";
+
+            interMsg.appendChild(senderEl);
+            interMsg.appendChild(bubble);
+            interMsg.appendChild(timeEl);
+
+            elTranscriptScroll.appendChild(interMsg);
+        }
+
+        const bubble = interMsg.querySelector(".msg-bubble");
+        if (bubble) bubble.textContent = text;
+        elTranscriptScroll.scrollTop = elTranscriptScroll.scrollHeight;
+        return;
+    }
+
+    // Remove intermediate message node if final transcript arrives
+    if (isUser && !isIntermediate) {
+        const interMsg = elTranscriptScroll.querySelector(".dialog-msg.intermediate-user");
+        if (interMsg) {
+            interMsg.remove();
+        }
+    }
+
+    const div = document.createElement("div");
     div.className = `dialog-msg ${isUser ? "user" : "agent"}`;
 
     const date    = timestamp ? new Date(timestamp) : new Date();
@@ -849,23 +894,6 @@ function renderSummary(data) {
             <h4>Recommended Next Action</h4>
             <p>${escapeHtml(data.recommended_next_action || "No recommendation.")}</p>
         </div>
-        ${data.failure_reason ? `
-        <div class="summary-card" style="border: 1px solid rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.05); border-radius: 8px; padding: 12px; margin-top: 12px;">
-            <h4 style="color: #ef4444; margin-top: 0; display: flex; align-items: center; gap: 8px; font-size: 0.95rem;">
-                <i class="fa-solid fa-triangle-exclamation"></i> Pipeline Failure Diagnostic
-            </h4>
-            <p style="font-size: 0.85rem; margin: 4px 0; color: var(--text-primary);">
-                <strong>Last State:</strong> <span style="font-family: monospace; background: rgba(239, 68, 68, 0.15); padding: 2px 6px; border-radius: 4px; color: #ef4444;">${escapeHtml(data.current_state || "UNKNOWN")}</span>
-            </p>
-            <p style="font-size: 0.85rem; margin: 4px 0 12px 0; color: var(--text-secondary);">
-                <strong>Reason:</strong> ${escapeHtml(data.failure_reason)}
-            </p>
-            ${data.error_stack ? `
-            <details style="font-size: 0.75rem; cursor: pointer; color: var(--text-secondary);">
-                <summary style="font-weight: 600; outline: none; margin-bottom: 6px; user-select: none;">Show developer error stack</summary>
-                <pre style="background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px; overflow-x: auto; font-family: monospace; white-space: pre; color: #f87171; border: 1px solid rgba(255,255,255,0.05);">${escapeHtml(data.error_stack)}</pre>
-            </details>` : ""}
-        </div>` : ""}
     `;
 }
 
@@ -878,12 +906,10 @@ function toggleMute() {
         elMuteBtn.classList.add("muted");
         elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone-slash"></i>`;
         elMicStatus.textContent = "Muted";
-        console.log("[Mic] Muted.");
     } else {
         elMuteBtn.classList.remove("muted");
         elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone"></i>`;
         elMicStatus.textContent = "Active";
-        console.log("[Mic] Unmuted.");
     }
 }
 

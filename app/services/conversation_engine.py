@@ -1,6 +1,7 @@
 import uuid
 import json
-from typing import Tuple, List, Dict, Any, Optional
+import re
+from typing import Tuple, List, Dict, Any, Optional, AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.session_manager import SessionManager
 from app.services.llm_service import LLMService
@@ -90,27 +91,28 @@ class ConversationEngine:
             }
         ]
 
-    async def process_turn(
+    async def process_turn_stream(
         self,
         call_id: str,
         campaign_id: uuid.UUID,
         customer_id: uuid.UUID,
         user_text: str
-    ) -> Tuple[str, bool, bool]:
-        """Runs the turn execution loop, resolving tool calls and outputting bot response flags."""
+    ) -> AsyncGenerator[Tuple[Optional[str], bool, bool], None]:
+        """
+        Streaming turn execution loop.
+        Yields (text_token, should_hangup, should_transfer) progressively.
+        """
         history = await self.session_manager.get_message_history(call_id)
         state = await self.session_manager.get_session_state(call_id) or "greeting"
-        
+
         # 1. Initialize session if empty
         if not history:
-            # Dynamically pull prompt template and run initial RAG lookup on user text
             compiled_prompt, _ = await self.prompt_service.build_prompt(
                 campaign_id=campaign_id,
                 customer_id=customer_id,
                 rag_query=user_text,
                 session_id=call_id
             )
-            # Add dynamic language constraints based on session metadata
             metadata = await self.session_manager.get_session_metadata(call_id)
             if metadata and "language" in metadata:
                 lang = metadata["language"]
@@ -128,15 +130,10 @@ class ConversationEngine:
                     )
             history.append({"role": "system", "content": compiled_prompt})
             await self.session_manager.append_message(call_id, history[-1])
-            
+
         # 2. Append user input
-        # FIX: Use CALL_START marker for the greeting so the LLM greets the
-        # customer instead of immediately calling tools. When user_text is "Hello"
-        # the LLM tends to call book_appointment / lookup_knowledge before speaking,
-        # exhausting the tool loop and returning empty content → no audio played.
         is_greeting = (user_text == "[CALL_START]")
         if is_greeting:
-            # Inject a system note so the LLM knows to greet rather than act
             history.append({
                 "role": "system",
                 "content": (
@@ -154,50 +151,38 @@ class ConversationEngine:
         history.append(user_turn)
         await self.session_manager.append_message(call_id, user_turn)
 
-
-        # 3. Agentic tool-call loop (max 3 iterations)
-        # FIX: The old loop ran while loop_limit > 0 and decremented at the bottom.
-        # When loop_limit hit 0, the while exited WITHOUT entering the `if not tool_calls`
-        # block, leaving `content = None` from the last tool-call response.
-        # Result: return content or "" → "", no audio, complete silence.
-        #
-        # New approach:
-        # - If the LLM returns tool_calls, execute them and loop.
-        # - If it returns text content, break immediately.
-        # - If the loop exhausts (LLM kept calling tools for 3 rounds with no text),
-        #   make ONE final forced completion call WITHOUT tools to guarantee text output.
+        # 3. Agentic tool-call loop
         should_hangup = False
         should_transfer = False
         loop_limit = 3
-        content: Optional[str] = None
-        made_tool_calls = False
-        # Greeting must never call tools — forces plain spoken text immediately
+        full_content_accumulator = []
         active_tools = None if is_greeting else self._get_tools_schema()
 
-
         while loop_limit > 0:
-            content, tool_calls = await self.llm_service.generate_completion(history, active_tools)
+            tool_calls_detected = None
 
+            async for text_chunk, t_calls in self.llm_service.generate_completion_stream(history, active_tools):
+                if t_calls:
+                    tool_calls_detected = t_calls
+                    break
+                if text_chunk:
+                    full_content_accumulator.append(text_chunk)
+                    yield text_chunk, False, False
 
-            if not tool_calls:
-                # LLM returned plain text — store and break
-                if content:
-                    bot_turn = {"role": "assistant", "content": content}
-                    history.append(bot_turn)
-                    await self.session_manager.append_message(call_id, bot_turn)
+            if not tool_calls_detected:
+                # Normal text response complete
                 break
 
-            # LLM returned tool calls — execute them
-            made_tool_calls = True
+            # LLM requested tool execution
             tool_calls_message = {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": tool_calls
+                "tool_calls": tool_calls_detected
             }
             history.append(tool_calls_message)
             await self.session_manager.append_message(call_id, tool_calls_message)
 
-            for tool_call in tool_calls:
+            for tool_call in tool_calls_detected:
                 tool_id = tool_call.get("id")
                 func_data = tool_call.get("function", {})
                 func_name = func_data.get("name")
@@ -208,34 +193,28 @@ class ConversationEngine:
                     pass
 
                 tool_result_content = ""
-
                 if func_name == "book_appointment":
                     state = "appointment_booked"
                     await self.session_manager.update_session_state(call_id, state)
                     tool_result_content = f"Appointment successfully scheduled for {args.get('date')} at {args.get('time')}."
-
                 elif func_name == "transfer_to_human":
                     state = "escalated"
                     await self.session_manager.update_session_state(call_id, state)
                     should_transfer = True
                     tool_result_content = "Call transfer successfully initiated."
-
                 elif func_name == "lookup_knowledge":
                     query = args.get("query", "")
                     facts = await self.rag_service.search_knowledge(campaign_id, query, limit=2)
                     facts_list = [f["text"] for f in facts]
                     tool_result_content = json.dumps({"facts": facts_list})
-
                 elif func_name == "confirm_appointment":
                     state = "appointment_confirmed"
                     await self.session_manager.update_session_state(call_id, state)
                     tool_result_content = "Appointment successfully confirmed in the database."
-
                 elif func_name == "reschedule_appointment":
                     state = "appointment_rescheduled"
                     await self.session_manager.update_session_state(call_id, state)
                     tool_result_content = f"Appointment rescheduled successfully for {args.get('new_date')} at {args.get('new_time')}."
-
                 else:
                     tool_result_content = f"Error: Tool '{func_name}' not implemented."
 
@@ -250,26 +229,14 @@ class ConversationEngine:
 
             loop_limit -= 1
 
-        # FIX: If the tool loop exhausted and content is still empty, make one
-        # final forced completion WITHOUT tools. This guarantees the bot always
-        # produces spoken text after executing tools.
-        if made_tool_calls and not content:
-            logger.warning(f"[ENGINE] Tool loop exhausted without text for {call_id}. Forcing final completion.")
-            content, _ = await self.llm_service.generate_completion(history, tools=None)
-            if content:
-                bot_turn = {"role": "assistant", "content": content}
-                history.append(bot_turn)
-                await self.session_manager.append_message(call_id, bot_turn)
-            else:
-                content = "I've taken care of that for you. Is there anything else I can help you with?"
+        full_text = "".join(full_content_accumulator).strip()
+        if full_text:
+            bot_turn = {"role": "assistant", "content": full_text}
+            history.append(bot_turn)
+            await self.session_manager.append_message(call_id, bot_turn)
 
-            
-        # Hangup detection — strict conditions to prevent premature termination:
-        # 1. Require at least 6 messages in history (system + 2+ exchanges) before considering hangup
-        # 2. Use unambiguous, complete farewell phrases only
-        # 3. State must be explicitly "completed" by a tool call
-        import re
-        low_content = (content or "").lower()
+        # Evaluate hangup condition
+        low_content = full_text.lower()
         assistant_turns = sum(1 for m in history if m.get("role") == "assistant")
         FAREWELL_RE = re.compile(
             r'\b(goodbye for now|have a great day|take care, goodbye|'
@@ -284,7 +251,27 @@ class ConversationEngine:
         if state == "escalated":
             should_transfer = True
 
-        return content or "", should_hangup, should_transfer
+        yield None, should_hangup, should_transfer
+
+    async def process_turn(
+        self,
+        call_id: str,
+        campaign_id: uuid.UUID,
+        customer_id: uuid.UUID,
+        user_text: str
+    ) -> Tuple[str, bool, bool]:
+        """Legacy turn execution helper that collects stream output into a single string."""
+        accumulated_text = []
+        final_hangup = False
+        final_transfer = False
+        async for chunk, h, t in self.process_turn_stream(call_id, campaign_id, customer_id, user_text):
+            if chunk:
+                accumulated_text.append(chunk)
+            if h:
+                final_hangup = True
+            if t:
+                final_transfer = True
+        return "".join(accumulated_text), final_hangup, final_transfer
 
     async def end_call(
         self,
@@ -298,7 +285,6 @@ class ConversationEngine:
         history = await self.session_manager.get_message_history(call_id)
         state = await self.session_manager.get_session_state(call_id) or "completed"
         
-        # Convert message list format to DB-friendly JSON list
         exchanges = []
         for msg in history:
             role = msg.get("role")
@@ -309,10 +295,9 @@ class ConversationEngine:
                     "text": content
                 })
                 
-        # Status calculation
         status_val = "completed"
         if state == "escalated":
-            status_val = "completed"  # Escalated is treated as completed handoff
+            status_val = "completed"
         elif not exchanges:
             status_val = "failed"
             
@@ -339,7 +324,5 @@ class ConversationEngine:
         
         created_log = await self.call_log_repo.create(call_log)
         await self.db.commit()
-        
-        # Purge Redis keys
         await self.session_manager.clear_session(call_id)
         return created_log

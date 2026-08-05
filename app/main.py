@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import time
+from typing import Dict, Any
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -14,8 +16,22 @@ from app.db.chroma import chroma_manager
 # Configure logging at startup
 setup_logging()
 
+# Global startup telemetry metrics dictionary
+STARTUP_METRICS: Dict[str, Any] = {
+    "boot_time_sec": 0.0,
+    "vad_load_ms": 0.0,
+    "stt_load_ms": 0.0,
+    "tts_load_ms": 0.0,
+    "llm_warmup_ms": 0.0,
+    "total_warmup_ms": 0.0,
+    "rss_mb": 0.0
+}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    startup_start = time.perf_counter()
+
     # Configure Torch optimizations on boot
     try:
         import torch
@@ -30,6 +46,7 @@ async def lifespan(app: FastAPI):
     try:
         import psutil
         rss = psutil.Process().memory_info().rss / (1024 * 1024)
+        STARTUP_METRICS["rss_mb"] = round(rss, 2)
         logger.info(f"[MEMORY] Startup initial RSS: {rss:.2f} MB")
     except Exception:
         pass
@@ -45,7 +62,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing external service connection pools...")
     chroma_manager.connect()
-    
+
     try:
         from app.services.rag_service import RAGService
         rag = RAGService()
@@ -84,42 +101,66 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[Startup] Voice profile auto-seed failed (non-fatal): {e}")
 
-
-    # Pre-load only lightweight models (VAD) in the background to keep memory usage low (<350MB idle)
+    # Eagerly warm up ALL AI pipeline services during server startup (no first-request latency penalty)
     try:
         import asyncio
-        import os
+        w_start = time.perf_counter()
 
-        async def load_models_sequentially():
-            if os.environ.get("PRELOAD_MODELS", "true").lower() != "true":
-                logger.info("Background model pre-loading is disabled (PRELOAD_MODELS != true).")
-                return
+        # 1. Warm up VAD
+        v_t0 = time.perf_counter()
+        from app.services.speech.vad.silero_provider import SileroVADProvider
+        def load_vad():
+            v = SileroVADProvider()
+            v.process_frame(b"\x00" * 160)
+            return v
+        await asyncio.get_event_loop().run_in_executor(None, load_vad)
+        STARTUP_METRICS["vad_load_ms"] = round((time.perf_counter() - v_t0) * 1000.0, 1)
 
-            # Wait 5 seconds after startup to ensure web server is fully responsive
-            await asyncio.sleep(5.0)
-            
-            try:
-                logger.info("Pre-loading lightweight SileroVADProvider in the background...")
-                from app.services.speech.vad.silero_provider import SileroVADProvider
-                def load_vad():
-                    return SileroVADProvider()
-                await asyncio.get_event_loop().run_in_executor(None, load_vad)
-                logger.info("SileroVADProvider pre-loaded successfully.")
-            except Exception as e:
-                logger.error(f"Failed to pre-load SileroVADProvider: {e}")
+        # 2. Warm up STT Singleton (Whisper)
+        s_t0 = time.perf_counter()
+        from app.services.stt_service import SpeechService
+        stt_ms = await SpeechService.warmup()
+        STARTUP_METRICS["stt_load_ms"] = round(stt_ms, 1)
 
-        asyncio.create_task(load_models_sequentially())
+        # 3. Warm up TTS Provider
+        t_t0 = time.perf_counter()
+        from app.services.tts_service import VoiceService
+        tts = VoiceService()
+        async for _ in tts.stream_speech("Hello"):
+            break
+        STARTUP_METRICS["tts_load_ms"] = round((time.perf_counter() - t_t0) * 1000.0, 1)
+
+        # 4. Warm up LLM Connection Pool (Groq/OpenRouter)
+        l_t0 = time.perf_counter()
+        try:
+            from app.services.llm_service import LLMService
+            llm = LLMService()
+            await llm.generate_completion([{"role": "user", "content": "hi"}])
+        except Exception as llm_err:
+            logger.warning(f"[WARMUP] LLM ping non-fatal error: {llm_err}")
+        STARTUP_METRICS["llm_warmup_ms"] = round((time.perf_counter() - l_t0) * 1000.0, 1)
+
+        tot_ms = (time.perf_counter() - w_start) * 1000.0
+        STARTUP_METRICS["total_warmup_ms"] = round(tot_ms, 1)
+        logger.info(
+            f"[WARMUP COMPLETE] All AI Subsystems Ready! "
+            f"VAD={STARTUP_METRICS['vad_load_ms']}ms | STT={STARTUP_METRICS['stt_load_ms']}ms | "
+            f"TTS={STARTUP_METRICS['tts_load_ms']}ms | LLM={STARTUP_METRICS['llm_warmup_ms']}ms"
+        )
+
     except Exception as e:
-        logger.error(f"Failed to register background Speech AI models preloading: {e}")
+        logger.error(f"[WARMUP ERROR] Failed during AI subsystems startup warmup: {e}")
+
+    STARTUP_METRICS["boot_time_sec"] = round(time.perf_counter() - startup_start, 2)
 
     yield
-    
+
     # Shutdown hook: Clean up pools
     logger.info("Shutting down external service connection pools...")
-    # Clean up engine connection pool
     from app.db.session import get_engine
     await get_engine().dispose()
     logger.info("Database connection pool disposed.")
+
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -129,7 +170,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Apply CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -138,10 +178,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Apply request tracing middleware
 app.add_middleware(RequestLoggingMiddleware)
 
-# Custom exception handler for uniform responses
+
 @app.exception_handler(AppException)
 async def app_exception_handler(request: Request, exc: AppException):
     logger.error(f"Application error occurred: {exc.message} (status: {exc.status_code})")
@@ -149,6 +188,7 @@ async def app_exception_handler(request: Request, exc: AppException):
         status_code=exc.status_code,
         content={"detail": exc.message, "status": "error"}
     )
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -158,23 +198,24 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "An internal system error occurred.", "status": "error"}
     )
 
-# Include Router
+
 app.include_router(api_v1_router, prefix="/api/v1")
 
-# Serve Voice Agent Demo Page
+
 @app.get("/voice-agent")
 async def voice_agent_page():
     from fastapi.responses import FileResponse
     return FileResponse("static/voice-agent.html")
 
-# Serve Favicon to prevent 404 errors
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon_route():
     from fastapi.responses import Response
     return Response(status_code=204)
 
-# Mount Static Files Dashboard
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 @app.get("/")
 async def root_redirect():

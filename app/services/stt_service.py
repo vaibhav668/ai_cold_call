@@ -15,8 +15,13 @@ class SpeechService:
         if provider_name == "faster_whisper":
             self.provider: SpeechToTextProvider = FasterWhisperProvider()
         else:
-            # Clean fallback if another provider config is requested (defaults to local whisper)
             self.provider: SpeechToTextProvider = FasterWhisperProvider()
+
+    @classmethod
+    async def warmup(cls) -> float:
+        """Warms up the STT singleton during application boot."""
+        provider = FasterWhisperProvider()
+        return await FasterWhisperProvider.warmup(provider.model_size)
 
     async def transcribe_utterance(
         self,

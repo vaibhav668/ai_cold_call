@@ -3,70 +3,70 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Voice Agent Demo | Enterprise Voice Platform</title>
-    <meta name="description" content="Experience real-time AI voice conversations directly in your browser. No phone number required.">
-
-    <!-- Premium Fonts -->
+    <title>Voice Agent Demo — Conversational AI</title>
+    <meta name="description" content="Interactive browser voice demo featuring low-latency speech recognition, AI conversational intelligence, and natural text-to-speech.">
+    <!-- Google Fonts & FontAwesome Icons -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-
-    <!-- FontAwesome Icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-
-    <!-- Main Style Sheet -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link rel="stylesheet" href="/static/css/voice-agent.css">
 </head>
 <body>
-    <!-- Background Gradients -->
-    <div class="bg-glow bg-glow-1"></div>
-    <div class="bg-glow bg-glow-2"></div>
 
+    <!-- Header Navigation Bar -->
     <header class="app-header">
-        <div class="logo">
-            <i class="fa-solid fa-microphone-lines"></i>
-            <span>VoiceAgent.AI</span>
+        <div class="header-left">
+            <a href="/" class="brand-logo">
+                <i class="fa-solid fa-brain brand-icon"></i>
+                <span class="brand-name">ColdCall<span class="brand-highlight">.AI</span></span>
+            </a>
+            <span class="badge badge-pulse">Live Demo</span>
         </div>
-        <a href="/static/index.html" class="nav-back-btn">
-            <i class="fa-solid fa-arrow-left-long"></i> Back to Dashboard
-        </a>
+        <div class="header-right">
+            <a href="/static/index.html" class="nav-link"><i class="fa-solid fa-chart-line"></i> Dashboard</a>
+            <a href="https://github.com/vaibhav668/ai_cold_call" target="_blank" class="nav-link"><i class="fa-brands fa-github"></i> GitHub</a>
+        </div>
     </header>
 
-    <main class="main-container">
-        <!-- Sidebar Panel (Controls) -->
-        <section class="control-panel glass-panel">
-            <div class="panel-section">
-                <h2>Configure Agent</h2>
-                <p class="section-desc">Customize your voice demo before starting.</p>
+    <!-- Main Container Grid -->
+    <main class="demo-container">
 
-                <!-- Industry Selector -->
+        <!-- Sidebar: Configuration Panel -->
+        <section class="sidebar-panel">
+            <div class="panel-section">
+                <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Session Setup</h3>
+                
+                <!-- Industry / Workflow Selection -->
                 <div class="form-group">
-                    <label for="industry-select"><i class="fa-solid fa-building"></i> Industry</label>
-                    <select id="industry-select" class="custom-select">
-                        <option value="hospital">Hospital Receptionist</option>
-                        <option value="real_estate">Real Estate Consultant</option>
+                    <label for="industry-select"><i class="fa-solid fa-building"></i> Industry Use Case</label>
+                    <select id="industry-select" class="form-select">
+                        <option value="hospital" selected>Hospital Receptionist (Mercy Hospital)</option>
+                        <option value="real_estate">Real Estate Consultant (Premium Realty)</option>
                     </select>
                 </div>
 
-                <!-- Language Selector -->
+                <!-- Language Selection -->
                 <div class="form-group">
-                    <label for="language-select"><i class="fa-solid fa-language"></i> Language</label>
-                    <select id="language-select" class="custom-select">
-                        <option value="English">English</option>
-                        <option value="Hindi">Hindi</option>
-                        <option value="Telugu">Telugu</option>
+                    <label for="language-select"><i class="fa-solid fa-language"></i> Agent Language</label>
+                    <select id="language-select" class="form-select">
+                        <option value="English" selected>English (India / US)</option>
+                        <option value="Hindi">Hindi (हिंदी)</option>
+                        <option value="Telugu">Telugu (తెలుగు)</option>
                     </select>
                 </div>
             </div>
 
-            <!-- Active Voice Display -->
-            <div class="panel-section selected-voice-details">
-                <h3>Active Voice Profile</h3>
-                <div class="voice-details-card">
-                    <div id="active-voice-avatar-wrap" class="avatar-wrap active-avatar-wrap"></div>
-                    <div class="voice-info">
-                        <h4 id="active-voice-name">Select a Voice</h4>
-                        <span id="active-voice-role" class="badge">—</span>
+            <!-- Voice Persona Info Card -->
+            <div class="panel-section">
+                <h3 class="section-title"><i class="fa-solid fa-user-gear"></i> Active Voice Persona</h3>
+                <div class="active-voice-card" id="active-voice-card">
+                    <div id="active-voice-avatar-wrap">
+                        <!-- Rendered by JS -->
+                    </div>
+                    <div class="voice-details">
+                        <h4 id="active-voice-name">Sophia</h4>
+                        <p class="voice-role" id="active-voice-role">Professional Female</p>
                         <p id="active-voice-desc">Click a voice in the circle to select it.</p>
                     </div>
                 </div>
@@ -97,6 +97,25 @@
                         <span class="metric-label" id="mic-status">Active</span>
                     </div>
                 </div>
+
+                <!-- Real-Time Telemetry Metrics Card -->
+                <div class="call-metrics hidden" id="telemetry-panel" style="margin-top: 12px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 12px;">
+                    <div class="metric" style="grid-column: span 3; text-align: left;">
+                        <span class="metric-label" style="color: var(--accent-primary); font-weight: 600;"><i class="fa-solid fa-bolt"></i> Real-Time Pipeline Telemetry</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Round-Trip</span>
+                        <span class="metric-value" id="tele-roundtrip" style="color: #38bdf8;">—</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">LLM (First Token)</span>
+                        <span class="metric-value" id="tele-llm" style="color: #a78bfa;">—</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">TTS (First Byte)</span>
+                        <span class="metric-value" id="tele-tts" style="color: #34d399;">—</span>
+                    </div>
+                </div>
             </div>
         </section>
 
@@ -108,29 +127,62 @@
                         <div class="orb-core"></div>
                         <div class="orb-wave wave-1"></div>
                         <div class="orb-wave wave-2"></div>
-                        <div class="orb-wave wave-3"></div>
                     </div>
-                    <div class="orb-status-text" id="orb-status-text">Choose a Voice</div>
+                    <p class="orb-status" id="orb-status-text">Select a voice to begin</p>
                 </div>
 
-                <!-- Voice nodes placed via JS -->
-                <div class="circular-voice-nodes" id="voice-nodes-container"></div>
+                <!-- Orbiting Voice Profile Nodes -->
+                <div class="voice-nodes-container" id="voice-nodes-container">
+                    <!-- Dynamic voice nodes rendered by JS -->
+                </div>
             </div>
         </section>
 
-        <!-- Removed transcript & summary panel for optimization -->
+        <!-- Right Side: Dialog & Transcript / Call Analytics -->
+        <section class="transcript-panel">
+            <!-- Tabs -->
+            <div class="tab-header">
+                <button class="tab-btn active" id="tab-transcript-btn">
+                    <i class="fa-solid fa-comments"></i> Live Transcript
+                </button>
+                <button class="tab-btn" id="tab-summary-btn" disabled>
+                    <i class="fa-solid fa-file-invoice"></i> Call Summary
+                </button>
+            </div>
+
+            <!-- Tab Content: Live Transcript -->
+            <div class="tab-content" id="transcript-tab-content">
+                <div class="dialog-scroll-container" id="transcript-scroll">
+                    <div class="empty-transcript-message" id="empty-transcript-msg">
+                        <i class="fa-solid fa-microphone-lines"></i>
+                        <p>Start a conversation to see live transcription and AI responses.</p>
+                    </div>
+                </div>
+
+                <!-- Typing / Thinking Indicator -->
+                <div class="typing-indicator hidden" id="typing-indicator">
+                    <div class="dot"></div>
+                    <div class="dot"></div>
+                    <div class="dot"></div>
+                    <span>AI is thinking...</span>
+                </div>
+            </div>
+
+            <!-- Tab Content: Call Summary (rendered post-call) -->
+            <div class="tab-content hidden" id="summary-tab-content">
+                <div class="summary-scroll-container" id="summary-scroll">
+                    <!-- Populated dynamically by JS post-call -->
+                </div>
+            </div>
+        </section>
+
     </main>
 
-    <!-- Floating Orb Widget -->
-    <div class="floating-widget-container" id="floating-widget">
-        <div class="widget-tooltip">Voice Demo</div>
-        <div class="widget-orb" id="widget-orb-click">
-            <i class="fa-solid fa-wave-square"></i>
-            <span class="widget-pulse"></span>
-        </div>
+    <!-- Floating Orb Quick-Nav Widget -->
+    <div class="widget-orb-fab" id="widget-orb-click" title="Scroll to Voice Agent">
+        <i class="fa-solid fa-microphone"></i>
     </div>
 
-    <!-- Main JS (loaded last, after DOM is ready) -->
     <script src="/static/js/voice-agent.js"></script>
 </body>
 </html>
