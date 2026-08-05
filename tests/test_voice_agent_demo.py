@@ -2,6 +2,7 @@ import pytest
 import uuid
 import json
 import base64
+import time
 from datetime import datetime, timezone
 from httpx import AsyncClient
 from fastapi.testclient import TestClient
@@ -225,3 +226,57 @@ async def test_websocket_stream_integration(override_auth, monkeypatch):
         data = json.loads(reply)
         assert "event" in data
         assert data["event"] in ["state_change", "transcript", "clear_audio"]
+
+@pytest.mark.anyio
+async def test_get_session_summary_success(client: AsyncClient, override_auth):
+    session_id = str(uuid.uuid4())
+    camp_id = str(uuid.uuid4())
+    cust_id = str(uuid.uuid4())
+    
+    mock_voice = VoiceProfile(
+        id=uuid.uuid4(),
+        name="Sophia",
+        description="Professional Female",
+        gender="Female",
+        supported_languages="English",
+        voice_provider="melotts",
+        voice_configuration='{}',
+        status="active"
+    )
+
+    _demo_sessions[session_id] = {
+        "session_id": session_id,
+        "campaign_id": camp_id,
+        "customer_id": cust_id,
+        "voice_profile": mock_voice,
+        "language": "English",
+        "industry": "hospital",
+        "created_at": datetime.now(),
+        "start_time": time.time() - 30,
+        "end_time": time.time(),
+        "transcript": [
+            {"sender": "agent", "text": "Hello Vaibhav.", "timestamp": datetime.utcnow().isoformat()},
+            {"sender": "user", "text": "Yes hello Sophia.", "timestamp": datetime.utcnow().isoformat()}
+        ]
+    }
+
+    # Test GET summary
+    res_get = await client.get(f"/api/v1/voice-demo/summary/{session_id}")
+    assert res_get.status_code == 200
+    data_get = res_get.json()
+    assert "summary" in data_get
+    assert data_get["language"] == "English"
+    assert data_get["voice_used"] == "Sophia"
+    assert data_get["industry"] == "hospital"
+    assert "lead_score" in data_get
+    assert "site_visit_status" in data_get
+    assert "extracted_variables" in data_get
+
+    # Test POST summary
+    res_post = await client.post(f"/api/v1/voice-demo/summary/{session_id}")
+    assert res_post.status_code == 200
+    data_post = res_post.json()
+    assert data_post["language"] == "English"
+    assert data_post["voice_used"] == "Sophia"
+    assert data_post["industry"] == "hospital"
+

@@ -29,7 +29,8 @@ class PromptService:
         self,
         campaign_id: uuid.UUID,
         customer_id: uuid.UUID,
-        rag_query: Optional[str] = None
+        rag_query: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> Tuple[str, Dict[str, Any]]:
         """Compile dynamic conversation prompt resolving template placeholders and appending RAG facts."""
         template = await self.template_repo.get_active_by_campaign(campaign_id)
@@ -52,10 +53,37 @@ class PromptService:
             for k, v in customer.custom_variables.items():
                 variables[k] = v
                 
+        # Resolve dynamic identity variables
+        agent_name = "Sophia"
+        hospital_name = "CityCare Hospital"
+        builder = "Skyline Developers"
+        property_name = "3 BHK Apartment"
+
+        if session_id:
+            from app.services.session_manager import SessionManager
+            sm = SessionManager()
+            session_meta = await sm.get_session_metadata(session_id)
+            if session_meta:
+                agent_name = session_meta.get("agent_name", "Sophia")
+
+        variables["agent_name"] = agent_name
+        variables["hospital_name"] = hospital_name
+        variables["builder"] = builder
+        variables["property_name"] = property_name
+
         compiled_sys = self._replace_placeholders(template.system_prompt, variables)
         compiled_goals = self._replace_placeholders(template.conversation_goals, variables)
         compiled_lang = self._replace_placeholders(template.language_prompt, variables)
         
+        # Replace hardcoded values to match runtime identity selections
+        compiled_sys = compiled_sys.replace("Sarah", agent_name).replace("James", agent_name)
+        compiled_sys = compiled_sys.replace("Mercy Hospital", hospital_name)
+        compiled_sys = compiled_sys.replace("Premium Realty", builder)
+
+        compiled_goals = compiled_goals.replace("Sarah", agent_name).replace("James", agent_name)
+        compiled_goals = compiled_goals.replace("Mercy Hospital", hospital_name)
+        compiled_goals = compiled_goals.replace("Premium Realty", builder)
+
         prompt_parts = [
             "### SYSTEM ROLE & INSTRUCTIONS",
             compiled_sys
@@ -75,7 +103,8 @@ class PromptService:
                 compiled_lang
             ])
             
-        if rag_query:
+        # Skip local SentenceTransformer model load on the CALL_START greeting initialization to prevent websocket timeouts
+        if rag_query and rag_query != "[CALL_START]":
             facts = await self.rag_service.search_knowledge(campaign_id, rag_query, limit=3)
             if facts:
                 facts_text = "\n".join([f"- {item['text']}" for item in facts])

@@ -107,7 +107,8 @@ class ConversationEngine:
             compiled_prompt, _ = await self.prompt_service.build_prompt(
                 campaign_id=campaign_id,
                 customer_id=customer_id,
-                rag_query=user_text
+                rag_query=user_text,
+                session_id=call_id
             )
             # Add dynamic language constraints based on session metadata
             metadata = await self.session_manager.get_session_metadata(call_id)

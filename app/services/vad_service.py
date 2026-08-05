@@ -32,17 +32,21 @@ class LegacyRMSDetector(VoiceActivityDetector):
         self._speech_frames = 0
         self._silence_frames = 0
         self._speech_confirmed = False
-        self.noise_floor = 150.0
+        self.noise_floor = None  # Lazy initialized on first frame
 
     def process_frame(self, audio_chunk: bytes) -> Optional[str]:
         rms = _rms(audio_chunk)
 
-        # Update dynamic noise floor
+        # Lazy initialize noise floor to first frame's energy level
+        if self.noise_floor is None:
+            self.noise_floor = max(50.0, min(800.0, rms))
+
+        # Update dynamic noise floor with faster adaptation rate for background hums
         if rms < self.noise_floor:
-            self.noise_floor = 0.95 * self.noise_floor + 0.05 * rms
+            self.noise_floor = 0.90 * self.noise_floor + 0.10 * rms
         else:
             if not self._in_speech:
-                self.noise_floor = 0.999 * self.noise_floor + 0.001 * rms
+                self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
 
         self.noise_floor = max(50.0, min(800.0, self.noise_floor))
 
@@ -81,11 +85,13 @@ class LegacyRMSDetector(VoiceActivityDetector):
 
     @property
     def speech_threshold(self) -> float:
-        return max(380.0, self.noise_floor + 250.0)
+        floor = self.noise_floor if self.noise_floor is not None else 150.0
+        return max(380.0, floor + 250.0)
 
     @property
     def silence_threshold(self) -> float:
-        return max(200.0, self.noise_floor + 100.0)
+        floor = self.noise_floor if self.noise_floor is not None else 150.0
+        return max(200.0, floor + 100.0)
 
 
 class EndOfSpeechDetector:
