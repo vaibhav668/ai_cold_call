@@ -1,19 +1,20 @@
+import audioop
+import asyncio
 import numpy as np
 import collections
 from typing import Optional
 from app.core.logging import logger
 from app.services.speech.vad.base import VoiceActivityDetector
 
-def decode_ulaw_sample(u_val: int) -> int:
-    """Decodes G.711 mu-law byte sample back to a 16-bit linear PCM signed integer."""
-    u_val = ~u_val & 0xFF
-    sign = (u_val & 0x80)
-    exponent = (u_val >> 4) & 0x07
-    mantissa = u_val & 0x0F
-    sample = (mantissa << 3) + 132
-    sample <<= exponent
-    sample -= 132
-    return -sample if sign else sample
+
+def _ulaw_chunk_to_float32_16k(audio_chunk: bytes) -> np.ndarray:
+    """
+    Convert a G.711 mu-law 8kHz chunk → float32 numpy array at 16kHz.
+    Uses C-level audioop — no Python loops, minimal GIL hold.
+    """
+    pcm_8k = audioop.ulaw2lin(audio_chunk, 2)
+    pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+    return np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 class SileroVADProvider(VoiceActivityDetector):
@@ -21,6 +22,10 @@ class SileroVADProvider(VoiceActivityDetector):
     Production-grade VAD provider utilizing Silero VAD.
     Uses frame accumulation to handle G.711 20ms chunks (320 samples at 16kHz)
     against Silero's 512-sample inference block requirement.
+
+    IMPORTANT: process_frame() is a pure synchronous method intended to be run
+    inside asyncio.get_event_loop().run_in_executor() — it must never be called
+    directly from an async coroutine running on the event loop thread.
     """
 
     _model_instance = None
@@ -42,7 +47,7 @@ class SileroVADProvider(VoiceActivityDetector):
                     logger.info(f"[MEMORY] Silero loaded: RSS {rss:.2f} MB")
                 except Exception:
                     pass
-            
+
             self.model = SileroVADProvider._model_instance
             if self.model is not None and self.model != "FAILED":
                 # min_silence_duration_ms=400 (20 frames of 20ms) matches our previous VAD timing
@@ -59,35 +64,35 @@ class SileroVADProvider(VoiceActivityDetector):
             SileroVADProvider._model_instance = "FAILED"
 
     def process_frame(self, audio_chunk: bytes) -> Optional[str]:
+        """
+        Process one 160-byte G.711 mu-law frame.
+        CPU-bound: must be called via run_in_executor from async code.
+        Returns: 'speech_start', 'speech_end', or None.
+        """
         if not audio_chunk or self.model is None or self.vad_iterator is None:
             return None
 
-        # 1. Decode G.711 mu-law (8kHz) to float32 linear PCM [-1.0, 1.0]
-        samples_8k = [decode_ulaw_sample(b) for b in audio_chunk]
-        x_8k = np.array(samples_8k, dtype=np.float32) / 32768.0
+        # 1. Decode G.711 mu-law (8kHz) → float32 16kHz using C audioop (no loops)
+        x_16k = _ulaw_chunk_to_float32_16k(audio_chunk)
 
-        # 2. Resample to 16kHz by duplicating samples
-        x_16k = np.repeat(x_8k, 2)
-
-        # 3. Append to accumulator
+        # 2. Append to accumulator
         self._accumulator.extend(x_16k.tolist())
 
         event = None
 
-        # 4. Process all available 512-sample blocks
+        # 3. Process all available 512-sample blocks
         while len(self._accumulator) >= 512:
-            # Extract first 512 samples
             block = []
             for _ in range(512):
                 block.append(self._accumulator.popleft())
-            
+
             # Feed block to Silero VADIterator
             try:
                 import torch
                 block_tensor = torch.tensor(block, dtype=torch.float32)
                 with torch.inference_mode():
                     result = self.vad_iterator(block_tensor)
-                
+
                 if result:
                     if "start" in result:
                         self._in_speech = True

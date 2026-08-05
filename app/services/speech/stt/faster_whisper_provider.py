@@ -1,9 +1,9 @@
 import os
 import io
 import wave
-import struct
-import httpx
+import audioop
 import asyncio
+import httpx
 import numpy as np
 from typing import Optional
 from app.core.logging import logger
@@ -16,16 +16,22 @@ _SILENCE_TOKENS = {
     "Mm.", "mm.", "Mmm.", "mmm.", "[Music]", "[Applause]", "[Laughter]",
 }
 
-def decode_ulaw_sample(u_val: int) -> int:
-    """Decodes G.711 mu-law byte sample back to a 16-bit linear PCM signed integer."""
-    u_val = ~u_val & 0xFF
-    sign = (u_val & 0x80)
-    exponent = (u_val >> 4) & 0x07
-    mantissa = u_val & 0x0F
-    sample = (mantissa << 3) + 132
-    sample <<= exponent
-    sample -= 132
-    return -sample if sign else sample
+
+def _ulaw_to_float32_16k(audio_bytes: bytes) -> np.ndarray:
+    """
+    Convert G.711 mu-law 8kHz bytes → float32 numpy array at 16kHz.
+    Uses C-level audioop functions throughout — no Python loops, no GIL pressure.
+    """
+    # Step 1: mu-law → 16-bit signed linear PCM @ 8kHz  (C library, single call)
+    pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
+
+    # Step 2: 8kHz → 16kHz using audioop.ratecv (polyphase C resampler)
+    # audioop.ratecv(fragment, width, nchannels, inrate, outrate, state, weightA=1, weightB=0)
+    pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+
+    # Step 3: Convert bytes → float32 numpy array in [-1, 1]
+    samples = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples
 
 
 class FasterWhisperProvider(SpeechToTextProvider):
@@ -59,8 +65,6 @@ class FasterWhisperProvider(SpeechToTextProvider):
                 logger.info(f"[STT] Initializing Faster-Whisper model '{model_size}' on CPU...")
                 # Run the blocking model loading inside executor to keep event loop responsive
                 def load_model():
-                    # Explicitly set download_root to /tmp to ensure write access on all
-                    # containerized platforms (Render, Railway, etc.) regardless of HOME dir.
                     if os.name != "nt":
                         cache_dir = os.environ.get("HF_HOME", "/tmp/hf_cache")
                         os.makedirs(cache_dir, exist_ok=True)
@@ -99,17 +103,15 @@ class FasterWhisperProvider(SpeechToTextProvider):
         model = await self._get_model(self.model_size)
         if model != "FAILED" and model is not None:
             try:
-                # Decode G.711 mu-law 8kHz to linear PCM
-                samples_8k = [decode_ulaw_sample(b) for b in audio_bytes]
-                x_8k = np.array(samples_8k, dtype=np.float32) / 32768.0
+                # Decode G.711 mu-law 8kHz → float32 16kHz (C-level, no Python loops)
+                def prepare_audio():
+                    return _ulaw_to_float32_16k(audio_bytes)
 
-                # Resample 8kHz -> 16kHz (simply duplicate each sample for speed)
-                x_16k = np.repeat(x_8k, 2)
+                x_16k = await asyncio.get_event_loop().run_in_executor(None, prepare_audio)
 
                 def run_transcription():
                     import torch
                     with torch.inference_mode():
-                        # Whisper large-v3-turbo detects language dynamically if language=None
                         segments, info = model.transcribe(
                             x_16k,
                             beam_size=3,
@@ -136,9 +138,8 @@ class FasterWhisperProvider(SpeechToTextProvider):
 
     async def _transcribe_cloud_fallback(self, audio_bytes: bytes, language: Optional[str] = None) -> Optional[str]:
         try:
-            # Convert G.711 mu-law bytes to a 16-bit mono WAV byte array
-            pcm_samples = [decode_ulaw_sample(b) for b in audio_bytes]
-            pcm_bytes = struct.pack(f"<{len(pcm_samples)}h", *pcm_samples)
+            # Convert G.711 mu-law bytes → 16-bit mono WAV using audioop (C-level, no loops)
+            pcm_bytes = audioop.ulaw2lin(audio_bytes, 2)
 
             wav_io = io.BytesIO()
             with wave.open(wav_io, "wb") as wav_file:

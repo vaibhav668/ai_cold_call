@@ -1,27 +1,21 @@
+import audioop
 from typing import Optional
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.speech.vad.base import VoiceActivityDetector
 from app.services.speech.vad.silero_provider import SileroVADProvider
 
-def decode_ulaw_sample(u_val: int) -> int:
-    """Decodes G.711 mu-law byte sample back to a 16-bit linear PCM signed integer."""
-    u_val = ~u_val & 0xFF
-    sign = (u_val & 0x80)
-    exponent = (u_val >> 4) & 0x07
-    mantissa = u_val & 0x0F
-    sample = (mantissa << 3) + 132
-    sample <<= exponent
-    sample -= 132
-    return -sample if sign else sample
 
-
-def _rms(audio_chunk: bytes) -> float:
-    """Compute RMS energy of a G.711 mu-law audio chunk."""
+def _rms_ulaw(audio_chunk: bytes) -> float:
+    """
+    Compute RMS energy of a G.711 mu-law audio chunk.
+    Uses audioop C functions — no Python decode loops.
+    """
     if not audio_chunk:
         return 0.0
-    total = sum(decode_ulaw_sample(b) ** 2 for b in audio_chunk)
-    return (total / len(audio_chunk)) ** 0.5
+    # Decode mu-law → linear16 in C, then compute RMS in C
+    pcm_bytes = audioop.ulaw2lin(audio_chunk, 2)
+    return audioop.rms(pcm_bytes, 2)
 
 
 class LegacyRMSDetector(VoiceActivityDetector):
@@ -35,7 +29,7 @@ class LegacyRMSDetector(VoiceActivityDetector):
         self.noise_floor = None  # Lazy initialized on first frame
 
     def process_frame(self, audio_chunk: bytes) -> Optional[str]:
-        rms = _rms(audio_chunk)
+        rms = _rms_ulaw(audio_chunk)
 
         # Lazy initialize noise floor to first frame's energy level
         if self.noise_floor is None:
@@ -98,6 +92,9 @@ class EndOfSpeechDetector:
     """
     Facade class acting as the primary VAD service.
     Encapsulates Silero VAD with local RMS fallback for high availability.
+
+    NOTE: process_frame is synchronous and CPU-bound (Silero uses PyTorch).
+    In async contexts, call it via: await loop.run_in_executor(None, self.process_frame, chunk)
     """
 
     def __init__(self) -> None:
@@ -145,4 +142,4 @@ class VADService:
         self.threshold = threshold
 
     def is_speech(self, audio_chunk: bytes) -> bool:
-        return _rms(audio_chunk) > self.threshold
+        return _rms_ulaw(audio_chunk) > self.threshold

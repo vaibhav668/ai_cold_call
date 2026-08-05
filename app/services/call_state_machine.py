@@ -54,6 +54,7 @@ _VALID_TRANSITIONS: dict[CallState, set[CallState]] = {
     },
     CallState.WAITING_FOR_CUSTOMER: {
         CallState.CUSTOMER_SPEAKING,
+        CallState.THINKING,              # pipeline re-entry when rapid speech follows
         CallState.CALL_COMPLETED,
         CallState.ERROR,
     },
@@ -69,6 +70,7 @@ _VALID_TRANSITIONS: dict[CallState, set[CallState]] = {
     },
     CallState.THINKING: {
         CallState.GENERATING_RESPONSE,
+        CallState.THINKING,               # rapid re-entry: new utterance while already thinking
         CallState.WAITING_FOR_CUSTOMER,   # LLM returned empty
         CallState.ERROR,
     },
