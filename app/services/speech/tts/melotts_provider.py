@@ -91,6 +91,7 @@ class MeloTTSProvider(TextToSpeechProvider):
     _model_instance = None
     _speaker_id = None
     _model_lock = asyncio.Lock()
+    _is_mock: bool = False
 
     @classmethod
     async def _get_model_and_speaker(cls):
@@ -126,6 +127,7 @@ class MeloTTSProvider(TextToSpeechProvider):
             except Exception as e:
                 logger.error(f"[TTS] Could not initialize local MeloTTS: {e}. Fallback to mock active.")
                 cls._model_instance = "FAILED"
+                cls._is_mock = True
             return cls._model_instance, cls._speaker_id
 
     async def stream_speech(
