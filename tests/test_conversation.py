@@ -118,7 +118,7 @@ async def test_conversation_turn_mock_llm(client: AsyncClient, override_auth, mo
     app.dependency_overrides[get_db_session] = mock_db
 
     from app.services.prompt_service import PromptService
-    async def mock_build(self, campaign_id, customer_id, rag_query=None):
+    async def mock_build(self, campaign_id, customer_id, rag_query=None, **kwargs):
         return "Welcoming Alice.", {}
     monkeypatch.setattr(PromptService, "build_prompt", mock_build)
     
@@ -162,7 +162,7 @@ async def test_conversation_turn_book_appointment(client: AsyncClient, override_
     app.dependency_overrides[get_db_session] = mock_db
 
     from app.services.prompt_service import PromptService
-    async def mock_build(self, campaign_id, customer_id, rag_query=None):
+    async def mock_build(self, campaign_id, customer_id, rag_query=None, **kwargs):
         return "Receptionist", {}
     monkeypatch.setattr(PromptService, "build_prompt", mock_build)
 
