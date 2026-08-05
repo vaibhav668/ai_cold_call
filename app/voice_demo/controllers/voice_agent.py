@@ -52,8 +52,12 @@ def linear2ulaw(sample: int) -> int:
 
 def pcm16_to_ulaw(pcm_bytes: bytes) -> bytes:
     """Convert raw 16-bit linear PCM bytes to G.711 mu-law."""
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-    return bytes(linear2ulaw(int(s)) for s in samples)
+    import audioop
+    try:
+        return audioop.lin2ulaw(pcm_bytes, 2)
+    except Exception as e:
+        logger.error(f"[AUDIO-TRANSCODE] Failed to convert PCM to mu-law: {e}")
+        return b""
 
 @router.get("/voices", response_model=List[VoiceProfileOut])
 async def get_voices(db: AsyncSession = Depends(get_db_session)):
@@ -227,7 +231,29 @@ async def get_session_summary(session_id: str):
     """
     meta = _demo_sessions.get(session_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Demo session not found.")
+        logger.warning(f"[SUMMARY] Session ID '{session_id}' not found in memory. Returning fallback summary.")
+        return SummaryOut(
+            summary="The conversation session metadata was lost or the server restarted.",
+            intent="None",
+            sentiment="Neutral",
+            duration_seconds=0,
+            extracted_information={},
+            lead_qualification="Not Applicable",
+            appointment_status="None",
+            knowledge_retrieved=[],
+            recommended_next_action="Please restart the conversation.",
+            transcript=[],
+            language="English",
+            voice_used="Sophia",
+            industry="hospital",
+            lead_score=0,
+            site_visit_status="None",
+            extracted_variables={},
+            session_id=session_id,
+            current_state="UNKNOWN (Session lost)",
+            failure_reason="Session ID not found in server memory (process restart or invalid session)",
+            error_stack=None
+        )
 
     # Calculate duration
     start = meta.get("start_time")
@@ -343,6 +369,10 @@ JSON SCHEMA:
     if not isinstance(extracted_vars, dict):
         extracted_vars = fallback_extracted
 
+    failure_reason = meta.get("failure_reason")
+    error_stack = meta.get("error_stack")
+    current_state = meta.get("current_state", "COMPLETED" if not failure_reason else "FAILED")
+
     return SummaryOut(
         summary=summary_data.get("summary", ""),
         intent=summary_data.get("intent", ""),
@@ -359,7 +389,11 @@ JSON SCHEMA:
         industry=industry,
         lead_score=summary_data.get("lead_score", 85),
         site_visit_status=summary_data.get("site_visit_status", "None"),
-        extracted_variables=extracted_vars
+        extracted_variables=extracted_vars,
+        session_id=session_id,
+        current_state=current_state,
+        failure_reason=failure_reason,
+        error_stack=error_stack
     )
 
 @router.websocket("/stream/{session_id}")
@@ -371,6 +405,7 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
     """
     await websocket.accept()
     logger.info(f"[DEMO-WS] Connected session: {session_id}")
+    logger.info("[AUDIO-CODEC] WebSocket established. Browser input: 16-bit linear PCM, 8kHz downsampled (frame size 4096 samples, chunk size 8192 bytes). Server output: 8-bit G.711 mu-law, 8kHz mono (20ms frames, 160 bytes each).")
 
     meta = _demo_sessions.get(session_id)
     if not meta:
@@ -454,6 +489,7 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
     # 1. Start send loop in background
     async def _send_loop():
         try:
+            chunks_sent = 0
             while not sm.is_terminal():
                 item = await audio_queue.get()
                 if item is _STOP_SENTINEL:
@@ -471,9 +507,14 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
                 # Send raw bytes to browser
                 try:
                     await websocket.send_bytes(item)
-                except Exception:
+                    chunks_sent += 1
+                    if chunks_sent % 50 == 0:
+                        logger.info(f"[WS-SEND] Streamed {chunks_sent} audio chunks ({len(item)} bytes each) to browser.")
+                except Exception as e:
+                    logger.error(f"[WS-SEND] Connection lost during audio stream: {e}")
                     break
                 await asyncio.sleep(0.02)
+            logger.info(f"[WS-SEND] Stream loop terminated. Total chunks sent: {chunks_sent}")
         except Exception as e:
             logger.error(f"[DEMO-WS] Send loop error: {e}")
 
@@ -618,10 +659,21 @@ async def voice_agent_websocket(websocket: WebSocket, session_id: str):
 
                         pipeline_task = asyncio.create_task(_transcribe_and_run(utterance_bytes))
 
-    except WebSocketDisconnect:
-        logger.info(f"[DEMO-WS] WebSocket disconnected for session {session_id}")
+    except WebSocketDisconnect as e:
+        logger.info(f"[DEMO-WS] WebSocket disconnect event triggered for session {session_id} (code={e.code}, reason={e.reason or 'None'})")
+        if e.code == 1006:
+            logger.warning(f"[DEMO-WS] Close Code 1006 indicates abnormal closure. This usually happens if the backend crashed (OOM), client terminated without handshake, or network failed.")
+        if meta:
+            meta["failure_reason"] = f"WebSocket disconnected: code={e.code}, reason={e.reason or 'None'}"
+            meta["current_state"] = sm.state.name
     except Exception as e:
-        logger.error(f"[DEMO-WS] WebSocket exception: {e}", exc_info=True)
+        import traceback
+        stack = traceback.format_exc()
+        logger.error(f"[DEMO-WS] WebSocket exception for session {session_id} inside state {sm.state.name}: {e}", exc_info=True)
+        if meta:
+            meta["failure_reason"] = f"WebSocket exception: {e}"
+            meta["current_state"] = sm.state.name
+            meta["error_stack"] = stack
     finally:
         # Save end time
         meta["end_time"] = time.time()
@@ -790,7 +842,13 @@ async def _run_pipeline(
         _tts_total = _time.perf_counter() - _tts_start
         logger.info(f"[METRICS] TTS Total: {_tts_total:.3f}s | chunks={chunks_count}")
     except Exception as e:
+        import traceback
+        stack = traceback.format_exc()
         logger.error(f"[DEMO-PIPELINE] TTS generation error: {e}")
+        if session_meta:
+            session_meta["failure_reason"] = f"TTS generation error: {e}"
+            session_meta["current_state"] = sm.state.name
+            session_meta["error_stack"] = stack
 
     _pipeline_total = _time.perf_counter() - _pipeline_start
     logger.info(f"[METRICS] Pipeline Total: {_pipeline_total:.3f}s | LLM={_llm_latency:.3f}s")

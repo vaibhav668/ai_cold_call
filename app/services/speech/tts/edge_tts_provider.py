@@ -82,19 +82,27 @@ def _resolve_voice(voice_config: Optional[dict], language: Optional[str]) -> str
 
 
 def _mp3_to_mulaw_chunks(mp3_bytes: bytes, chunk_size: int = 160) -> list:
-    """Convert MP3 bytes → G.711 mu-law 8kHz mono 20ms chunks."""
+    """Convert MP3 bytes → G.711 mu-law 8kHz mono 20ms chunks using miniaudio."""
     try:
-        import pydub
-        audio = pydub.AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
-        # Resample to 8kHz mono 16-bit PCM
-        audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-        pcm_bytes = audio.raw_data
+        import miniaudio
+        decoded = miniaudio.decode(
+            mp3_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=8000
+        )
+        pcm_bytes = decoded.raw_data
+        pcm_len = len(pcm_bytes)
+        samples_count = pcm_len // 2
+        duration_sec = samples_count / 8000.0
+        
+        logger.info(f"[EdgeTTS] PCM Output: sample_rate=8000, channels=1, dtype=int16, buffer_length={pcm_len} bytes, samples_count={samples_count}, duration={duration_sec:.3f}s")
+        
+        # Convert PCM linear16 → G.711 mu-law
+        mulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
     except Exception as e:
         logger.error(f"[EdgeTTS] MP3→PCM conversion failed: {e}")
         return []
-
-    # Convert PCM linear16 → G.711 mu-law
-    mulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
 
     # Split into 160-byte (20ms @ 8kHz) chunks
     chunks = []

@@ -166,6 +166,10 @@ class MeloTTSProvider(TextToSpeechProvider):
                     tmp_path = tmpfile.name
 
                 try:
+                    import time as _time
+                    _start_synthesis = _time.perf_counter()
+                    logger.info(f"[TTS] MeloTTS generation started for voice_id={speaker_id}, speed={speed}, text: '{processed_text[:60]}...'")
+
                     def generate():
                         import torch
                         with torch.inference_mode():
@@ -173,11 +177,16 @@ class MeloTTSProvider(TextToSpeechProvider):
                     
                     # Run synthesis in executor
                     await asyncio.get_event_loop().run_in_executor(None, generate)
+                    _synthesis_time = _time.perf_counter() - _start_synthesis
+                    logger.info(f"[TTS] MeloTTS generation finished in {_synthesis_time:.3f}s")
 
                     if cancel_event and cancel_event.is_set():
                         logger.info("[TTS] Cancelled after synthesis.")
                         return
 
+                    import time as _time
+                    _start_decode = _time.perf_counter()
+                    
                     # Decode synthesized WAV at 8kHz PCMU target
                     decoded = miniaudio.decode_file(
                         tmp_path,
@@ -185,19 +194,35 @@ class MeloTTSProvider(TextToSpeechProvider):
                         nchannels=1,
                         output_format=miniaudio.SampleFormat.SIGNED16
                     )
+                    
+                    import audioop
+                    pcm_len = len(decoded.raw_data)
+                    samples_count = pcm_len // 2
+                    duration_sec = samples_count / 8000.0
+                    
+                    logger.info(f"[TTS] MeloTTS PCM Output: sample_rate=8000, channels=1, dtype=int16, buffer_length={pcm_len} bytes, samples_count={samples_count}, duration={duration_sec:.3f}s")
 
-                    mulaw_bytes = bytes(linear2ulaw(s) for s in decoded.samples)
+                    # Convert PCM 16-bit to 8-bit G.711 mu-law
+                    mulaw_bytes = audioop.lin2ulaw(decoded.raw_data, 2)
+                    _decode_time = _time.perf_counter() - _start_decode
+                    logger.info(f"[TTS] Transcoded PCM -> G.711 mu-law in {_decode_time:.3f}s. Yielding chunks...")
 
                     # Stream G.711 mu-law 20ms (160 bytes) frames
                     for i in range(0, len(mulaw_bytes), 160):
                         if cancel_event and cancel_event.is_set():
                             logger.info("[TTS] Cancelled mid-stream.")
                             return
-                        yield mulaw_bytes[i:i + 160]
+                        chunk = mulaw_bytes[i:i + 160]
+                        if len(chunk) < 160:
+                            chunk = chunk.ljust(160, b'\xff')
+                        yield chunk
 
                 finally:
                     if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                        try:
+                            os.remove(tmp_path)
+                        except Exception as rm_err:
+                            logger.error(f"[TTS] Failed to remove temp WAV file: {rm_err}")
                 return
             except Exception as e:
                 logger.error(f"[TTS] MeloTTS synthesis failed: {e}. Falling back to mock audio...")

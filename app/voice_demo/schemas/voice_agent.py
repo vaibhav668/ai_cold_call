@@ -45,11 +45,15 @@ class SummaryOut(BaseModel):
     knowledge_retrieved: List[str]
     recommended_next_action: str
     transcript: List[Dict[str, Any]]
-    # New metrics requested
     language: str
     voice_used: str
     industry: str
     lead_score: Optional[int] = None
     site_visit_status: str
     extracted_variables: Dict[str, Any]
+    # Failure tracing fields
+    session_id: Optional[str] = None
+    current_state: Optional[str] = None
+    failure_reason: Optional[str] = None
+    error_stack: Optional[str] = None
 

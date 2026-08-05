@@ -402,8 +402,30 @@ async function startConversation() {
         websocket.onclose = (evt) => {
             console.log(`[WS] Closed (code=${evt.code}, wasClean=${evt.wasClean}, byUs=${wsClosedByUs})`);
             if (!wsClosedByUs) {
-                // Server closed the connection — run cleanup
-                stopConversation();
+                let errMsg = "Connection closed unexpectedly.";
+                if (evt.code === 1006) {
+                    errMsg = "Audio streaming failed or TTS generation crashed on the server (Code 1006).";
+                }
+                appendSystemMessage(errMsg);
+                
+                // Transition UI state to error instead of abruptly destroying state
+                setOrbState(CallState.ERROR, "Failed");
+                stopAllAudio();
+                stopTimer();
+                
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(t => t.stop());
+                    mediaStream = null;
+                }
+                if (scriptProcessorNode) { scriptProcessorNode.disconnect(); scriptProcessorNode = null; }
+                if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+                
+                elStatus.textContent = "Error";
+                elStatus.style.color = "var(--error-color)";
+                elTabSummary.disabled = false;
+                
+                fetchSummary();
+                resetUIAfterCall();
             }
         };
 
@@ -796,6 +818,23 @@ function renderSummary(data) {
             <h4>Recommended Next Action</h4>
             <p>${escapeHtml(data.recommended_next_action || "No recommendation.")}</p>
         </div>
+        ${data.failure_reason ? `
+        <div class="summary-card" style="border: 1px solid rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.05); border-radius: 8px; padding: 12px; margin-top: 12px;">
+            <h4 style="color: #ef4444; margin-top: 0; display: flex; align-items: center; gap: 8px; font-size: 0.95rem;">
+                <i class="fa-solid fa-triangle-exclamation"></i> Pipeline Failure Diagnostic
+            </h4>
+            <p style="font-size: 0.85rem; margin: 4px 0; color: var(--text-primary);">
+                <strong>Last State:</strong> <span style="font-family: monospace; background: rgba(239, 68, 68, 0.15); padding: 2px 6px; border-radius: 4px; color: #ef4444;">${escapeHtml(data.current_state || "UNKNOWN")}</span>
+            </p>
+            <p style="font-size: 0.85rem; margin: 4px 0 12px 0; color: var(--text-secondary);">
+                <strong>Reason:</strong> ${escapeHtml(data.failure_reason)}
+            </p>
+            ${data.error_stack ? `
+            <details style="font-size: 0.75rem; cursor: pointer; color: var(--text-secondary);">
+                <summary style="font-weight: 600; outline: none; margin-bottom: 6px; user-select: none;">Show developer error stack</summary>
+                <pre style="background: rgba(0, 0, 0, 0.2); padding: 8px; border-radius: 4px; overflow-x: auto; font-family: monospace; white-space: pre; color: #f87171; border: 1px solid rgba(255, 255, 255, 0.05);">${escapeHtml(data.error_stack)}</pre>
+            </details>` : ""}
+        </div>` : ""}
     `;
 }
 
