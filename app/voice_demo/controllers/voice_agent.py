@@ -134,7 +134,7 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
             raise HTTPException(status_code=404, detail=f"No campaign configured for industry '{setup.industry}'.")
 
     # 3. Resolve, Create or Update Customer named 'Vaibhav' to ensure seed parameters match user requirements
-    cust_query = select(Customer).where(Customer.first_name == "Vaibhav")
+    cust_query = select(Customer).where(Customer.phone_number == "+15551234567")
     cust_res = await db.execute(cust_query)
     customer = cust_res.scalars().first()
 
@@ -161,7 +161,7 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
         })
 
     if not customer:
-        logger.info("[SESSION] Customer Vaibhav not found. Creating customer...")
+        logger.info("[SESSION] Customer Vaibhav not found by phone number. Creating customer...")
         customer = Customer(
             id=uuid.uuid4(),
             first_name="Vaibhav",
@@ -173,7 +173,10 @@ async def create_session(setup: SessionSetupIn, db: AsyncSession = Depends(get_d
         )
         db.add(customer)
     else:
-        logger.info("[SESSION] Customer Vaibhav found. Updating variables...")
+        logger.info("[SESSION] Customer Vaibhav found by phone number. Updating variables and name...")
+        customer.first_name = "Vaibhav"
+        customer.last_name = ""
+        customer.email = "vaibhav.demo@example.com"
         customer.custom_variables = custom_vars
         customer.is_active = True
 
