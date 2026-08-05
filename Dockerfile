@@ -35,23 +35,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy project files
-COPY . .
-
 # ─── Runtime environment ──────────────────────────────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
-# Point ALL model caches to /tmp — writable by any user, survives the build
-# Whisper (CTranslate2 / faster-whisper)
-ENV HF_HOME=/tmp/hf_cache
-ENV HUGGINGFACE_HUB_CACHE=/tmp/hf_cache
-ENV TRANSFORMERS_CACHE=/tmp/hf_cache
-# MeloTTS downloads to XDG cache
-ENV XDG_CACHE_HOME=/tmp/xdg_cache
-# Torch model dir
-ENV TORCH_HOME=/tmp/torch_cache
+# Point ALL model caches to persistent paths under /app/models/
+ENV HF_HOME=/app/models/hf_cache
+ENV HUGGINGFACE_HUB_CACHE=/app/models/hf_cache
+ENV TRANSFORMERS_CACHE=/app/models/hf_cache
+ENV XDG_CACHE_HOME=/app/models/xdg_cache
+ENV TORCH_HOME=/app/models/torch_cache
+
+# Copy project files
+COPY . .
+
+# Run preloading script to bake models into the image during build time
+RUN python preload_models.py
 
 EXPOSE 8000
 
