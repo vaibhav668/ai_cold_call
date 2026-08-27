@@ -312,18 +312,27 @@ function autoAdaptVoicesForLangAndIndustry() {
 // ─────────────────────────────────────────────────────────────────────────────
 async function ensureAudioContexts() {
     if (!captureContext) {
-        captureContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+        captureContext = new (window.AudioContext || window.webkitAudioContext)();
     }
     if (captureContext.state === "suspended") {
         await captureContext.resume();
     }
 
     if (!playbackContext) {
-        playbackContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+        playbackContext = new (window.AudioContext || window.webkitAudioContext)();
     }
     if (playbackContext.state === "suspended") {
         await playbackContext.resume();
     }
+
+    // Instantly wake up mobile & desktop hardware DAC audio route with a silent warmup buffer
+    try {
+        const warmBuf = playbackContext.createBuffer(1, 1, playbackContext.sampleRate);
+        const warmSrc = playbackContext.createBufferSource();
+        warmSrc.buffer = warmBuf;
+        warmSrc.connect(playbackContext.destination);
+        warmSrc.start(0);
+    } catch (_) {}
 
     audioContextStarted = true;
     nextPlayTime = 0;
