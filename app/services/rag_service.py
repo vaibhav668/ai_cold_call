@@ -238,7 +238,11 @@ class RAGService:
                 break
 
         if not campaign_key:
-            return []
+            q_low = query.lower()
+            if any(w in q_low for w in ["bhk", "flat", "apartment", "real estate", "property", "gachibowli", "skyline"]):
+                campaign_key = "real_estate"
+            else:
+                campaign_key = "hospital"
 
         facts = DEMO_FACTS.get(campaign_key, [])
         scored_results = []
