@@ -71,6 +71,12 @@ class GroqProvider(BaseLLMProvider):
         self.model = settings.LLM_MODEL
         self.url = "https://api.groq.com/openai/v1/chat/completions"
 
+    def _resolve_model(self) -> str:
+        model = self.model
+        if model == "qwen3-instruct":
+            return "qwen-2.5-32b"
+        return model
+
     async def generate_completion(
         self,
         messages: List[Dict[str, str]],
@@ -85,7 +91,7 @@ class GroqProvider(BaseLLMProvider):
             "Content-Type": "application/json"
         }
         payload = {
-            "model": self.model,
+            "model": self._resolve_model(),
             "messages": messages
         }
         if tools:
@@ -120,7 +126,7 @@ class GroqProvider(BaseLLMProvider):
             "Content-Type": "application/json"
         }
         payload = {
-            "model": self.model,
+            "model": self._resolve_model(),
             "messages": messages,
             "stream": True
         }
@@ -193,6 +199,14 @@ class OpenRouterProvider(BaseLLMProvider):
         self.model = settings.LLM_MODEL
         self.url = "https://openrouter.ai/api/v1/chat/completions"
 
+    def _resolve_model(self) -> str:
+        model = self.model
+        if "llama-3.1-8b" in model:
+            return "meta-llama/llama-3.1-8b-instruct"
+        if model == "qwen3-instruct":
+            return "qwen/qwen-2.5-72b-instruct"
+        return model
+
     async def generate_completion(
         self,
         messages: List[Dict[str, str]],
@@ -207,11 +221,7 @@ class OpenRouterProvider(BaseLLMProvider):
             "HTTP-Referer": "https://voice-agent-api.onrender.com",
             "X-Title": "VoiceAgent.AI"
         }
-        model = self.model
-        if "llama-3.1-8b" in model:
-            model = "meta-llama/llama-3.1-8b-instruct"
-
-        payload = {"model": model, "messages": messages}
+        payload = {"model": self._resolve_model(), "messages": messages}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -233,15 +243,105 @@ class OpenRouterProvider(BaseLLMProvider):
         messages: List[Dict[str, str]],
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> AsyncGenerator[Tuple[Optional[str], Optional[List[Dict[str, Any]]]], None]:
-        # Simple non-stream fallback wrapper for OpenRouter
-        content, t_calls = await self.generate_completion(messages, tools)
-        yield content, t_calls
+        """Real SSE streaming implementation for OpenRouter."""
+        if not self.api_key or self.api_key in ("test_openrouter_key", "test_openai_key"):
+            content, t_calls = await self.generate_completion(messages, tools)
+            yield content, t_calls
+            return
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://voice-agent-api.onrender.com",
+            "X-Title": "VoiceAgent.AI"
+        }
+        payload = {
+            "model": self._resolve_model(),
+            "messages": messages,
+            "stream": True
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                async with client.stream("POST", self.url, headers=headers, json=payload) as response:
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        logger.warning(f"[OpenRouter Stream] Error {response.status_code}: {error_body.decode()[:200]}. Falling back to non-stream.")
+                        content, t_calls = await self.generate_completion(messages, tools)
+                        yield content, t_calls
+                        return
+
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk_data = json.loads(data_str)
+                            choices = chunk_data.get("choices", [])
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
+
+                            text_delta = delta.get("content")
+                            if text_delta:
+                                yield text_delta, None
+
+                            t_deltas = delta.get("tool_calls")
+                            if t_deltas:
+                                for td in t_deltas:
+                                    idx = td.get("index", 0)
+                                    if idx not in tool_calls_accumulator:
+                                        tool_calls_accumulator[idx] = {
+                                            "id": td.get("id", ""),
+                                            "type": td.get("type", "function"),
+                                            "function": {"name": "", "arguments": ""}
+                                        }
+                                    if td.get("id"):
+                                        tool_calls_accumulator[idx]["id"] = td["id"]
+                                    fn = td.get("function", {})
+                                    if fn.get("name"):
+                                        tool_calls_accumulator[idx]["function"]["name"] += fn["name"]
+                                    if fn.get("arguments"):
+                                        tool_calls_accumulator[idx]["function"]["arguments"] += fn["arguments"]
+
+                        except Exception as parse_err:
+                            logger.debug(f"[OpenRouter Stream] Parse line error: {parse_err}")
+
+        except Exception as e:
+            logger.warning(f"[OpenRouter Stream] Streaming failed: {e}. Falling back to non-stream.")
+            content, t_calls = await self.generate_completion(messages, tools)
+            yield content, t_calls
+            return
+
+        if tool_calls_accumulator:
+            final_tools = [v for k, v in sorted(tool_calls_accumulator.items())]
+            yield None, final_tools
 
 
 class LLMManager:
     def __init__(self) -> None:
-        self.primary = GroqProvider()
-        self.fallback = OpenRouterProvider()
+        provider_type = settings.LLM_PROVIDER.lower() if settings.LLM_PROVIDER else "groq"
+        if provider_type == "qwen":
+            # Groq decommissioned qwen-2.5-32b; route Qwen models directly to OpenRouter.
+            self.primary = OpenRouterProvider()
+            self.fallback = GroqProvider()
+        elif provider_type == "groq":
+            self.primary = GroqProvider()
+            self.fallback = OpenRouterProvider()
+        elif provider_type == "openrouter":
+            self.primary = OpenRouterProvider()
+            self.fallback = GroqProvider()
+        else:
+            self.primary = GroqProvider()
+            self.fallback = OpenRouterProvider()
 
     async def generate_completion(
         self,
@@ -251,7 +351,7 @@ class LLMManager:
         try:
             return await self.primary.generate_completion(messages, tools)
         except Exception as e:
-            logger.warning(f"Primary LLM Provider (Groq) failed: {e}. Switching to Fallback Provider...")
+            logger.warning(f"Primary LLM Provider failed: {e}. Switching to Fallback Provider...")
             try:
                 return await self.fallback.generate_completion(messages, tools)
             except Exception as fe:
@@ -267,7 +367,7 @@ class LLMManager:
             async for chunk in self.primary.generate_completion_stream(messages, tools):
                 yield chunk
         except Exception as e:
-            logger.warning(f"[LLM Stream] Primary Groq stream failed: {e}. Falling back to OpenRouter...")
+            logger.warning(f"[LLM Stream] Primary stream failed: {e}. Falling back to secondary...")
             try:
                 async for chunk in self.fallback.generate_completion_stream(messages, tools):
                     yield chunk

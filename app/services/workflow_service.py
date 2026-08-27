@@ -23,8 +23,9 @@ class WorkflowService:
                 ),
                 language_prompt=(
                     "Speak clearly, use simple vocabulary, and short conversational sentences "
-                    "suitable for high-quality text-to-speech rendering. Keep a professional, "
-                    "reassuring, and gentle tone."
+                    "(1-2 sentences maximum per turn) suitable for high-quality text-to-speech rendering. "
+                    "NEVER use markdown formatting, bold text, asterisks, or lists. Spell out abbreviations. "
+                    "Keep a professional, reassuring, and gentle tone."
                 ),
                 conversation_goals=(
                     "- Goal 1: Confirm you are speaking with {{first_name}} {{last_name}}.\n"
@@ -51,7 +52,8 @@ class WorkflowService:
                 ),
                 language_prompt=(
                     "Speak with a confident, polite, energetic, and articulate tone. "
-                    "Keep sentences engaging, conversational, and direct."
+                    "Keep sentences engaging, conversational, and direct (1-2 sentences maximum per turn). "
+                    "NEVER use markdown formatting, bold text, asterisks, or lists. Spell out abbreviations."
                 ),
                 conversation_goals=(
                     "- Goal 1: Verify you are speaking with {{first_name}}.\n"

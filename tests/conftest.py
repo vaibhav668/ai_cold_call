@@ -8,6 +8,8 @@ from typing import AsyncGenerator
 from app.services.embeddings.bge_m3_provider import BGEM3EmbeddingProvider
 from app.services.speech.stt.faster_whisper_provider import FasterWhisperProvider
 from app.services.speech.tts.melotts_provider import MeloTTSProvider
+from app.services.speech.tts.kokoro_provider import KokoroProvider
+from app.services.speech.tts.edge_tts_provider import EdgeTTSProvider
 from app.services.speech.vad.silero_provider import SileroVADProvider
 
 # 1. Mock BGEM3EmbeddingProvider to return 1024-dimensional mock vectors
@@ -20,11 +22,13 @@ async def mock_transcribe(self, audio_bytes, language=None):
     return "hello reschedule please"
 FasterWhisperProvider.transcribe_utterance = mock_transcribe
 
-# 3. Mock MeloTTSProvider to yield mock G.711 mu-law chunks without file decoding
-async def mock_stream_speech(self, text, cancel_event=None, language=None):
+# 3. Mock MeloTTSProvider and KokoroProvider to yield mock G.711 mu-law chunks without file decoding or downloading
+async def mock_stream_speech(self, text, cancel_event=None, language=None, voice_config=None):
     for _ in range(5):
         yield b"\xff" * 160
 MeloTTSProvider.stream_speech = mock_stream_speech
+KokoroProvider.stream_speech = mock_stream_speech
+EdgeTTSProvider.stream_speech = mock_stream_speech
 
 # 4. Mock SileroVADProvider model loaders to prevent Hub downloads
 def mock_init(self):

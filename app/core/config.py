@@ -1,3 +1,25 @@
+# Enable UTF-8 encoding by default on Windows to prevent UnicodeDecodeError in external libraries (like kokoro-onnx)
+import builtins
+import sys
+
+if sys.platform == "win32":
+    _original_open = builtins.open
+    def _utf8_open(file, *args, **kwargs):
+        mode = kwargs.get("mode", args[0] if len(args) > 0 else "r")
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "utf-8"
+        return _original_open(file, *args, **kwargs)
+    builtins.open = _utf8_open
+
+# Global NumPy 2.x compatibility patch for Kokoro ONNX voice pickle loading
+import numpy as np
+_original_np_load = np.load
+def _patched_np_load(*args, **kwargs):
+    if "allow_pickle" not in kwargs:
+        kwargs["allow_pickle"] = True
+    return _original_np_load(*args, **kwargs)
+np.load = _patched_np_load
+
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -29,17 +51,42 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     GROQ_API_KEY: Optional[str] = None
     OPENROUTER_API_KEY: Optional[str] = None
-    LLM_PROVIDER: str = "groq"
+    LLM_PROVIDER: str = "qwen"
     FALLBACK_LLM_PROVIDER: str = "openrouter"
-    LLM_MODEL: str = "llama-3.1-8b-instant"
+    LLM_MODEL: str = "qwen3-instruct"
 
     # Speech AI providers
     STT_PROVIDER: str = "faster_whisper"
     WHISPER_MODEL: str = "large-v3-turbo"
     VAD_PROVIDER: str = "silero"
-    TTS_PROVIDER: str = "melotts"
+    TTS_PROVIDER: str = "kokoro"
     EMBEDDING_PROVIDER: str = "bge_m3"
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
+
+    # Kokoro TTS specifics
+    KOKORO_MODEL_DIR: str = "./models/kokoro"
+    KOKORO_DEFAULT_SPEED: float = 1.15
+    
+    # Kokoro Voice Mapping defaults (can be overridden via env vars)
+    KOKORO_VOICE_SOPHIA_EN: str = "af_nicole"
+    KOKORO_VOICE_SOPHIA_HI: str = "hf_alpha"
+    KOKORO_VOICE_SOPHIA_TE: str = "af_nicole"
+
+    KOKORO_VOICE_MAYA_EN: str = "af_sky"
+    KOKORO_VOICE_MAYA_HI: str = "hf_beta"
+    KOKORO_VOICE_MAYA_TE: str = "af_sky"
+
+    KOKORO_VOICE_ANANYA_EN: str = "af_bella"
+    KOKORO_VOICE_ANANYA_HI: str = "hf_alpha"
+    KOKORO_VOICE_ANANYA_TE: str = "af_bella"
+
+    KOKORO_VOICE_ARJUN_EN: str = "am_michael"
+    KOKORO_VOICE_ARJUN_HI: str = "hm_omega"
+    KOKORO_VOICE_ARJUN_TE: str = "am_michael"
+
+    KOKORO_VOICE_DAVID_EN: str = "am_adam"
+    KOKORO_VOICE_DAVID_HI: str = "hm_psi"
+    KOKORO_VOICE_DAVID_TE: str = "am_adam"
 
 
     # Security & Authentication
@@ -72,7 +119,7 @@ def check_low_memory() -> bool:
     """
     import os
     # 1. Explicit environment overrides or platform indicators
-    if os.environ.get("LOW_MEMORY_DEPLOYMENT", "true").lower() == "true":
+    if os.environ.get("LOW_MEMORY_DEPLOYMENT", "false").lower() == "true":
         return True
     if os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID") or os.environ.get("RENDER_INSTANCE_ID"):
         return True

@@ -211,10 +211,10 @@ async def main():
         if not customer:
             customer = Customer(
                 id=uuid.uuid4(),
-                first_name="Vaibhav",
-                last_name="Pokhriyal",
+                first_name="Demo",
+                last_name="User",
                 phone_number=customer_phone,
-                email="vpokhriyal35@gmail.com",
+                email="demo.user@example.com",
                 custom_variables=custom_vars,
                 is_active=True
             )

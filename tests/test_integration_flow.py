@@ -250,6 +250,12 @@ def test_websocket_conversation_flow(integration_db, monkeypatch):
         return "yes, confirm my appointment please"
     monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_stt_transcribe)
 
+    # Mock LLMManager to avoid real outbound API calls
+    from app.services.llm_service import LLMManager
+    async def mock_generate_stream(self, messages, tools=None):
+        yield "Your appointment is confirmed. Thank you. Goodbye!", None
+    monkeypatch.setattr(LLMManager, "generate_completion_stream", mock_generate_stream)
+
     with client.websocket_connect(f"/api/v1/telephony/stream/{call_id}") as ws:
         # Start connection
         ws.send_text(json.dumps({
@@ -284,6 +290,12 @@ def test_websocket_reschedule_conversation_flow(integration_db, monkeypatch):
     async def mock_stt_transcribe(self, audio_bytes, language=None):
         return "I want to reschedule for next Monday at 2 pm"
     monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_stt_transcribe)
+
+    # Mock LLMManager to avoid real outbound API calls
+    from app.services.llm_service import LLMManager
+    async def mock_generate_stream(self, messages, tools=None):
+        yield "No problem. I have rescheduled your appointment.", None
+    monkeypatch.setattr(LLMManager, "generate_completion_stream", mock_generate_stream)
 
     with client.websocket_connect(f"/api/v1/telephony/stream/{call_id}") as ws:
         # Start connection

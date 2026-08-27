@@ -43,7 +43,7 @@ from app.schemas.telephony import CallTriggerIn, CallTriggerOut
 from app.services.telephony_service import TelephonyService
 from app.services.vad_service import EndOfSpeechDetector
 from app.services.stt_service import SpeechService
-from app.services.tts_service import VoiceService
+from app.services.tts_service import VoiceService, get_voice_service
 from app.services.conversation_engine import ConversationEngine
 from app.services.call_state_machine import CallStateMachine, CallState
 from app.models.call_log import CallLog
@@ -371,7 +371,7 @@ async def _run_pipeline(
     logger.info(f"[PIPELINE] Starting TTS synthesis for: '{response_text[:60]}...'")
 
     # ── AI_SPEAKING ───────────────────────────────────────────────────────
-    tts = VoiceService()
+    tts = get_voice_service()
     cancel_event.clear()  # Fresh cancellation token for this utterance
     await sm.transition(CallState.AI_SPEAKING)
 

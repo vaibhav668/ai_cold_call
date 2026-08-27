@@ -6,13 +6,12 @@ from app.services.embeddings.base import EmbeddingProvider
 
 class BGEM3EmbeddingProvider(EmbeddingProvider):
     """
-    Multilingual embedding provider using the BAAI/bge-m3 model or all-MiniLM-L6-v2.
-    Dynamically adjusts dimension based on environment memory footprint constraint.
+    Embedding provider using sentence-transformers.
     """
 
     _model_instance = None
     _model_lock = asyncio.Lock()
-    _dimension = 1024
+    _dimension = 384
 
     def __init__(self) -> None:
         from app.core.config import check_low_memory
@@ -22,18 +21,16 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
         if low_mem and "bge-m3" in configured_model.lower():
             logger.warning(
                 f"[EMBEDDINGS] Low-memory environment detected. Overriding heavy model '{configured_model}' "
-                f"to lightweight 'all-MiniLM-L6-v2' (384-d, ~30MB RAM) to prevent 600MB+ RSS OOM crash."
+                f"to lightweight 'all-MiniLM-L6-v2' (384-d, ~30MB RAM) to prevent OOM."
             )
             self.model_name = "all-MiniLM-L6-v2"
         else:
             self.model_name = configured_model
 
-        # Dynamic dimension resolution based on active model name
         BGEM3EmbeddingProvider._dimension = 1024 if "bge-m3" in self.model_name else 384
 
     @classmethod
     async def _get_model(cls, model_name: str):
-        """Loads and caches the SentenceTransformer model instance as a singleton."""
         if cls._model_instance is not None:
             return cls._model_instance
 
@@ -44,7 +41,6 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
             try:
                 from sentence_transformers import SentenceTransformer
                 logger.info(f"[EMBEDDINGS] Initializing model '{model_name}' locally (CPU)...")
-                # Run blocking load inside executor
                 def load():
                     return SentenceTransformer(model_name, device="cpu")
                 
@@ -65,14 +61,12 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
         if not texts:
             return []
 
-        # 1. Try local SentenceTransformer model
         model = await self._get_model(self.model_name)
         if model != "FAILED" and model is not None:
             try:
                 def encode_texts():
                     import torch
                     with torch.inference_mode():
-                        # Generate embeddings, returns list of numpy arrays
                         raw_vecs = model.encode(texts, normalize_embeddings=True)
                     return [vec.tolist() for vec in raw_vecs]
 
@@ -80,7 +74,6 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
             except Exception as e:
                 logger.error(f"[EMBEDDINGS] Local embedding encoding failed: {e}")
 
-        # 2. Mock fallback (dimension is dynamic)
         return self._mock_embeddings(texts)
 
     async def get_query_embedding(self, text: str) -> List[float]:
@@ -94,10 +87,9 @@ class BGEM3EmbeddingProvider(EmbeddingProvider):
     def _mock_embeddings(self, texts: List[str]) -> List[List[float]]:
         import random
         dim = self.dimension
-        logger.warning(f"[EMBEDDINGS] SentenceTransformer failed or not initialized. Returning {dim}-d mock embeddings...")
+        logger.warning(f"[EMBEDDINGS] SentenceTransformer failed. Returning {dim}-d mock embeddings...")
         results = []
         for text in texts:
-            # Deterministic mock based on text length for stable testing
             random.seed(len(text))
             results.append([random.uniform(-1.0, 1.0) for _ in range(dim)])
         return results

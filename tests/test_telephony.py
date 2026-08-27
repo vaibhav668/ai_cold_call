@@ -175,6 +175,11 @@ def test_websocket_audio_stream(monkeypatch):
         return "hello reschedule please"
     monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_transcribe)
 
+    from app.services.llm_service import LLMManager
+    async def mock_generate_stream(self, messages, tools=None):
+        yield "Hello! I can help you with your appointment.", None
+    monkeypatch.setattr(LLMManager, "generate_completion_stream", mock_generate_stream)
+
     # We use FastAPI's sync TestClient for Websockets routing tests
     client = TestClient(app)
     with client.websocket_connect("/api/v1/telephony/stream/test_call_sid_123") as ws:

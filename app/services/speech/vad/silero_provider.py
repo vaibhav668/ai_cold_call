@@ -6,26 +6,18 @@ from typing import Optional
 from app.core.logging import logger
 from app.services.speech.vad.base import VoiceActivityDetector
 
-
 def _ulaw_chunk_to_float32_16k(audio_chunk: bytes) -> np.ndarray:
     """
     Convert a G.711 mu-law 8kHz chunk → float32 numpy array at 16kHz.
-    Uses C-level audioop — no Python loops, minimal GIL hold.
+    Uses C-level audioop.
     """
     pcm_8k = audioop.ulaw2lin(audio_chunk, 2)
     pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
     return np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
 
-
 class SileroVADProvider(VoiceActivityDetector):
     """
-    Production-grade VAD provider utilizing Silero VAD.
-    Uses frame accumulation to handle G.711 20ms chunks (320 samples at 16kHz)
-    against Silero's 512-sample inference block requirement.
-
-    IMPORTANT: process_frame() is a pure synchronous method intended to be run
-    inside asyncio.get_event_loop().run_in_executor() — it must never be called
-    directly from an async coroutine running on the event loop thread.
+    VAD provider utilizing Silero VAD.
     """
 
     _model_instance = None
@@ -33,8 +25,8 @@ class SileroVADProvider(VoiceActivityDetector):
     def __init__(self) -> None:
         self.model = None
         self.vad_iterator = None
-        self._accumulator = collections.deque()
         self._in_speech = False
+        self._np_accumulator = np.empty(0, dtype=np.float32)
 
         try:
             from silero_vad import load_silero_vad, VADIterator
@@ -50,46 +42,40 @@ class SileroVADProvider(VoiceActivityDetector):
 
             self.model = SileroVADProvider._model_instance
             if self.model is not None and self.model != "FAILED":
-                # min_silence_duration_ms=400 (20 frames of 20ms) matches our previous VAD timing
+                # Base silence tolerance: 700ms prevents cutting short utterances.
+                # (raised from 600ms to give speakers extra time to finish a name
+                # and capture trailing consonants like the 'v' in "Vaibhav").
+                # Name-collection mode uses 900ms (set externally via set_name_collection_mode).
+                self._base_silence_ms = 700
+                self._current_silence_ms = self._base_silence_ms
                 self.vad_iterator = VADIterator(
                     self.model,
-                    threshold=0.5,
+                    threshold=0.4,
                     sampling_rate=16000,
-                    min_silence_duration_ms=400,
-                    speech_pad_ms=30
+                    min_silence_duration_ms=self._base_silence_ms,
+                    speech_pad_ms=60,               # Pad speech boundaries to capture trailing consonants
                 )
                 logger.info("[VAD] Silero VAD iterator initialized.")
         except Exception as e:
-            logger.error(f"[VAD] Failed to initialize Silero VAD model: {e}. Fallback to RMS VAD enabled.")
+            logger.error(f"[VAD] Failed to initialize Silero VAD model: {e}. Fallback enabled.")
             SileroVADProvider._model_instance = "FAILED"
 
     def process_frame(self, audio_chunk: bytes) -> Optional[str]:
-        """
-        Process one 160-byte G.711 mu-law frame.
-        CPU-bound: must be called via run_in_executor from async code.
-        Returns: 'speech_start', 'speech_end', or None.
-        """
         if not audio_chunk or self.model is None or self.vad_iterator is None:
             return None
 
-        # 1. Decode G.711 mu-law (8kHz) → float32 16kHz using C audioop (no loops)
         x_16k = _ulaw_chunk_to_float32_16k(audio_chunk)
-
-        # 2. Append to accumulator
-        self._accumulator.extend(x_16k.tolist())
-
+        self._np_accumulator = np.concatenate([self._np_accumulator, x_16k])
         event = None
 
-        # 3. Process all available 512-sample blocks
-        while len(self._accumulator) >= 512:
-            block = []
-            for _ in range(512):
-                block.append(self._accumulator.popleft())
+        while len(self._np_accumulator) >= 512:
+            block = self._np_accumulator[:512]
+            self._np_accumulator = self._np_accumulator[512:]
 
-            # Feed block to Silero VADIterator
             try:
                 import torch
-                block_tensor = torch.tensor(block, dtype=torch.float32)
+                # Share underlying numpy memory directly to prevent memory copies
+                block_tensor = torch.from_numpy(block)
                 with torch.inference_mode():
                     result = self.vad_iterator(block_tensor)
 
@@ -106,7 +92,7 @@ class SileroVADProvider(VoiceActivityDetector):
         return event
 
     def reset(self) -> None:
-        self._accumulator.clear()
+        self._np_accumulator = np.empty(0, dtype=np.float32)
         self._in_speech = False
         if self.vad_iterator is not None:
             try:

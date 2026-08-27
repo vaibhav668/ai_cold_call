@@ -1,58 +1,20 @@
-/**
- * Voice Agent Demo — Frontend Logic
- *
- * Architecture:
- *   Browser Mic → PCM16 (8kHz) → WebSocket → Backend (VAD/Streaming STT/Progressive LLM/Progressive TTS)
- *   Backend → G.711 mu-law (8kHz) → WebSocket → 8kHz Playback Queue → Speaker
- *
- * Key features:
- *  - Sub-second start latency for initial greeting
- *  - Dedicated 8kHz playback AudioContext (zero audio drift)
- *  - AudioWorkletNode capture off main thread (ScriptProcessorNode fallback)
- *  - Live intermediate speech transcription as user speaks
- *  - Real-time latency metrics dashboard (Round-Trip, LLM, TTS, VAD)
- *  - 15s WebSocket keepalive ping (prevents Render idle timeout)
- */
-
 "use strict";
 
-const RENDER_BACKEND    = "https://ai-cold-call.onrender.com";
-const RENDER_WS_BACKEND = "wss://ai-cold-call.onrender.com";
+const API_BASE = window.location.origin;
+const WS_BASE  = window.location.origin.replace(/^http/, "ws");
 
-function getApiBase() {
-    const host = window.location.hostname;
-    if (host.includes("vercel.app") || (host.includes("onrender.com") === false && host !== "localhost" && host !== "127.0.0.1")) {
-        return RENDER_BACKEND;
-    }
-    return "";
-}
-
-function getWsBase() {
-    const apiBase = getApiBase();
-    if (apiBase) return apiBase.replace(/^http/, "ws");
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${window.location.host}`;
-}
-
-const API_BASE = getApiBase();
-const WS_BASE  = getWsBase();
 console.log(`[Config] API_BASE="${API_BASE}" WS_BASE="${WS_BASE}"`);
 
 // ─── Global State ─────────────────────────────────────────────────────────────
-let activeVoiceId   = null;
+let activeVoiceName = "Sophia";
 let activeVoiceObj  = null;
 let voices          = [];
-let industries      = [];
 let sessionId       = null;
 let websocket       = null;
 let wsClosedByUs    = false;
 let connectionState = "disconnected";
 
-// Timer
-let callTimerInterval   = null;
-let callDurationSeconds = 0;
-
-// Audio
+// Audio Contexts
 let captureContext   = null;  // 44100 Hz
 let playbackContext  = null;  // 8000 Hz
 let mediaStream      = null;
@@ -62,18 +24,24 @@ let nextPlayTime     = 0;
 let isMuted          = false;
 let audioContextStarted = false;
 
+// ─── Echo-isolation: block mic frames while AI is speaking ─────────────────
+// speakerProtectionUntil: timestamp (ms) after which mic re-activates.
+// This prevents trailing speaker audio from leaking into STT.
+let isAiSpeaking          = false;
+let speakerProtectionUntil = 0;  // performance.now() timestamp
+const SPEAKER_PROTECTION_MS = 350;  // 350ms mute after AI finishes
+
 // WebSocket keepalive
 let pingInterval = null;
 
 // ─── DOM References ───────────────────────────────────────────────────────────
-let elIndustry, elLanguage, elStartBtn, elEndBtn, elCallMetrics,
-    elStatus, elTimer, elMuteBtn, elMicStatus,
+let elIndustry, elLanguage, elStartBtn, elEndBtn,
+    elStatus, elMuteBtn, elMicStatus,
     elOrb, elOrbStatus, elVoiceNodes, elActiveAvatarWrap,
-    elActiveVoiceName, elActiveVoiceRole, elActiveVoiceDesc,
-    elTranscriptScroll, elEmptyMsg, elTypingIndicator,
-    elSummaryScroll, elTabTranscript, elTabSummary,
-    elTranscriptContent, elSummaryContent, elWidgetOrb,
-    elTelemetryPanel, elTeleRoundtrip, elTeleLlm, elTeleTts;
+    elActiveVoiceName, elActiveVoiceRole, elActiveVoiceLangs, elActiveVoiceDesc,
+    elScenarioText, elThankYouModal, elModalRetryBtn, elMicIndicator, elPreviewBtn;
+
+let previewAudio = null;
 
 // ─── CallState Enum ───────────────────────────────────────────────────────────
 const CallState = {
@@ -90,64 +58,109 @@ const CallState = {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
-    elIndustry         = document.getElementById("industry-select");
-    elLanguage         = document.getElementById("language-select");
-    elStartBtn         = document.getElementById("start-btn");
-    elEndBtn           = document.getElementById("end-btn");
-    elCallMetrics      = document.getElementById("call-metrics");
-    elStatus           = document.getElementById("connection-status");
-    elTimer            = document.getElementById("call-timer");
-    elMuteBtn          = document.getElementById("mute-btn");
-    elMicStatus        = document.getElementById("mic-status");
-    elOrb              = document.getElementById("ai-orb");
-    elOrbStatus        = document.getElementById("orb-status-text");
-    elVoiceNodes       = document.getElementById("voice-nodes-container");
-    elActiveAvatarWrap = document.getElementById("active-voice-avatar-wrap");
-    elActiveVoiceName  = document.getElementById("active-voice-name");
-    elActiveVoiceRole  = document.getElementById("active-voice-role");
-    elActiveVoiceDesc  = document.getElementById("active-voice-desc");
-    elTranscriptScroll = document.getElementById("transcript-scroll");
-    elEmptyMsg         = document.getElementById("empty-transcript-msg");
-    elTypingIndicator  = document.getElementById("typing-indicator");
-    elSummaryScroll    = document.getElementById("summary-scroll");
-    elTabTranscript    = document.getElementById("tab-transcript-btn");
-    elTabSummary       = document.getElementById("tab-summary-btn");
-    elTranscriptContent= document.getElementById("transcript-tab-content");
-    elSummaryContent   = document.getElementById("summary-tab-content");
-    elWidgetOrb        = document.getElementById("widget-orb-click");
-    elTelemetryPanel   = document.getElementById("telemetry-panel");
-    elTeleRoundtrip    = document.getElementById("tele-roundtrip");
-    elTeleLlm          = document.getElementById("tele-llm");
-    elTeleTts          = document.getElementById("tele-tts");
+    elIndustry          = document.getElementById("industry-select");
+    elLanguage          = document.getElementById("language-select");
+    elStartBtn          = document.getElementById("start-btn");
+    elEndBtn            = document.getElementById("end-btn");
+    elStatus            = document.getElementById("orb-status-text");
+    elMuteBtn           = document.getElementById("mute-btn");
+    elMicStatus         = document.getElementById("mic-status");
+    elMicIndicator      = document.querySelector(".mic-indicator");
+    elOrb               = document.getElementById("ai-orb");
+    elOrbStatus         = document.getElementById("orb-status-text");
+    elVoiceNodes        = document.getElementById("voice-nodes-container");
+    elActiveAvatarWrap  = document.getElementById("active-voice-avatar-wrap");
+    elActiveVoiceName   = document.getElementById("active-voice-name");
+    elActiveVoiceRole   = document.getElementById("active-voice-role");
+    elActiveVoiceLangs  = document.getElementById("active-voice-langs");
+    elActiveVoiceDesc   = document.getElementById("active-voice-desc");
+    elScenarioText      = document.getElementById("scenario-info-text");
+    elThankYouModal     = document.getElementById("thank-you-modal");
+    elModalRetryBtn     = document.getElementById("modal-retry-btn");
+    elPreviewBtn        = document.getElementById("preview-btn");
 
     setupListeners();
     loadVoices();
-    loadIndustries();
+    updateScenarioText();
 });
 
 function setupListeners() {
     elStartBtn.addEventListener("click", startConversation);
     elEndBtn.addEventListener("click", stopConversation);
     elMuteBtn.addEventListener("click", toggleMute);
-    if (elTabTranscript) elTabTranscript.addEventListener("click", () => switchTab("transcript"));
-    if (elTabSummary)    elTabSummary.addEventListener("click",    () => switchTab("summary"));
-    elWidgetOrb.addEventListener("click", () => {
-        document.getElementById("circular-arena").scrollIntoView({ behavior: "smooth" });
+    elPreviewBtn.addEventListener("click", playVoicePreview);
+    
+    elIndustry.addEventListener("change", () => {
+        updateScenarioText();
+        autoAdaptVoicesForLangAndIndustry();
+    });
+    
+    elLanguage.addEventListener("change", () => {
+        autoAdaptVoicesForLangAndIndustry();
+    });
+
+    elModalRetryBtn.addEventListener("click", () => {
+        elThankYouModal.classList.add("hidden");
     });
 }
 
+function updateScenarioText() {
+    if (elIndustry.value === "hospital") {
+        elScenarioText.textContent = "Book hospital appointments naturally, reschedule check-up dates, and answer medical FAQs with our automated healthcare receptionist.";
+    } else {
+        elScenarioText.textContent = "Browse premium listings, understand budget requirements, and schedule visits to Orchard Heights with our real estate AI sales executive.";
+    }
+}
+
+function playVoicePreview() {
+    if (previewAudio) {
+        previewAudio.pause();
+        previewAudio = null;
+        elPreviewBtn.innerHTML = `<i class="fa-solid fa-play"></i>`;
+        return;
+    }
+
+    const voice = activeVoiceName;
+    const lang = elLanguage.value;
+    
+    elPreviewBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i>`;
+    const previewUrl = `${API_BASE}/api/v1/voice-demo/preview?voice=${voice}&lang=${lang}`;
+    
+    previewAudio = new Audio(previewUrl);
+    previewAudio.oncanplaythrough = () => {
+        elPreviewBtn.innerHTML = `<i class="fa-solid fa-pause"></i>`;
+        previewAudio.play().catch(e => {
+            console.error("Failed to play preview audio:", e);
+            elPreviewBtn.innerHTML = `<i class="fa-solid fa-play"></i>`;
+            previewAudio = null;
+        });
+    };
+    
+    previewAudio.onended = () => {
+        elPreviewBtn.innerHTML = `<i class="fa-solid fa-play"></i>`;
+        previewAudio = null;
+    };
+    
+    previewAudio.onerror = () => {
+        console.error("Preview audio failed to load.");
+        elPreviewBtn.innerHTML = `<i class="fa-solid fa-play"></i>`;
+        previewAudio = null;
+    };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Avatar Generator
+// Avatar SVG Helper
 // ─────────────────────────────────────────────────────────────────────────────
 function makeSvgAvatar(name, gender) {
     const initial  = (name || "?").charAt(0).toUpperCase();
     const isFemale = gender === "Female";
-    const c1 = isFemale ? "#f43f5e" : "#6366f1";
+    const c1 = isFemale ? "#a855f7" : "#6366f1";
     const c2 = isFemale ? "#ec4899" : "#3b82f6";
     const svgNS = "http://www.w3.org/2000/svg";
     const svg   = document.createElementNS(svgNS, "svg");
     svg.setAttribute("viewBox", "0 0 100 100");
-    svg.setAttribute("width", "100"); svg.setAttribute("height", "100");
+    svg.setAttribute("width", "100"); 
+    svg.setAttribute("height", "100");
 
     const defs = document.createElementNS(svgNS, "defs");
     const grad  = document.createElementNS(svgNS, "linearGradient");
@@ -155,25 +168,34 @@ function makeSvgAvatar(name, gender) {
     grad.setAttribute("id", gId);
     grad.setAttribute("x1","0%"); grad.setAttribute("y1","0%");
     grad.setAttribute("x2","100%"); grad.setAttribute("y2","100%");
+    
     const s1 = document.createElementNS(svgNS, "stop");
     s1.setAttribute("offset","0%"); s1.setAttribute("stop-color", c1);
+    
     const s2 = document.createElementNS(svgNS, "stop");
     s2.setAttribute("offset","100%"); s2.setAttribute("stop-color", c2);
-    grad.appendChild(s1); grad.appendChild(s2); defs.appendChild(grad);
+    
+    grad.appendChild(s1); 
+    grad.appendChild(s2); 
+    defs.appendChild(grad);
     svg.appendChild(defs);
 
     const circle = document.createElementNS(svgNS, "circle");
-    circle.setAttribute("cx","50"); circle.setAttribute("cy","50");
-    circle.setAttribute("r","50"); circle.setAttribute("fill", `url(#${gId})`);
+    circle.setAttribute("cx","50"); 
+    circle.setAttribute("cy","50");
+    circle.setAttribute("r","50"); 
+    circle.setAttribute("fill", `url(#${gId})`);
     svg.appendChild(circle);
 
     const text = document.createElementNS(svgNS, "text");
-    text.setAttribute("x","50%"); text.setAttribute("y","54%");
+    text.setAttribute("x","50%"); 
+    text.setAttribute("y","54%");
     text.setAttribute("dominant-baseline","middle");
     text.setAttribute("text-anchor","middle");
-    text.setAttribute("font-size","40"); text.setAttribute("font-weight","700");
+    text.setAttribute("font-size","42"); 
+    text.setAttribute("font-weight","700");
     text.setAttribute("fill","#ffffff");
-    text.setAttribute("font-family","Inter, sans-serif");
+    text.setAttribute("font-family","Outfit, sans-serif");
     text.textContent = initial;
     svg.appendChild(text);
 
@@ -183,285 +205,114 @@ function makeSvgAvatar(name, gender) {
 
 function createAvatarElement(voice, sizePx) {
     const img = document.createElement("img");
-    img.width = sizePx; img.height = sizePx;
+    img.width = sizePx; 
+    img.height = sizePx;
     img.alt = voice.name;
     img.style.borderRadius = "50%";
     img.style.objectFit   = "cover";
     img.style.display     = "block";
-
-    const fallbackSrc = makeSvgAvatar(voice.name, voice.gender);
-    if (voice.avatar && voice.avatar !== "null" && voice.avatar !== "undefined") {
-        let avatarUrl = voice.avatar;
-        if (avatarUrl.includes("/static/images/avatars/") && avatarUrl.endsWith(".png")) {
-            avatarUrl = avatarUrl.replace(".png", ".svg");
-        }
-        img.src = avatarUrl;
-        img.onerror = function() { this.src = fallbackSrc; this.onerror = null; };
-    } else {
-        img.src = fallbackSrc;
-    }
+    img.src = makeSvgAvatar(voice.name, voice.gender);
     return img;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// API Loaders
+// Load Voice Profiles
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadVoices() {
     try {
-        console.log("[Voices] Fetching voice profiles...");
+        console.log("[Voices] Loading voice configurations...");
         const res = await fetch(`${API_BASE}/api/v1/voice-demo/voices`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         voices = await res.json();
-        console.log(`[Voices] Loaded ${voices.length} profiles:`, voices.map(v => v.name));
         renderVoiceCircle();
-        if (voices.length > 0) selectVoice(voices[0].id);
+        if (voices.length > 0) selectVoice(voices[0].name);
     } catch (err) {
-        console.error("[Voices] Failed to load:", err);
-        elOrbStatus.textContent = "Could not load voices";
+        console.error("[Voices] Failed to load voice config:", err);
+        elOrbStatus.textContent = "Error loading voices";
     }
 }
 
-async function loadIndustries() {
-    try {
-        const res = await fetch(`${API_BASE}/api/v1/voice-demo/industries`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        industries = await res.json();
-        elIndustry.innerHTML = industries
-            .map(i => `<option value="${i.id}">${i.name}</option>`)
-            .join("");
-        console.log("[Industries] Loaded:", industries.map(i => i.name));
-    } catch (err) {
-        console.error("[Industries] Failed to load:", err);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Voice Circle Renderer
-// ─────────────────────────────────────────────────────────────────────────────
 function renderVoiceCircle() {
+    if (!elVoiceNodes) return;
     elVoiceNodes.innerHTML = "";
     const total  = voices.length;
-    const radius = 170;
+    const isMobile = window.innerWidth <= 768;
+    const radius = isMobile ? 112 : 138;
 
     voices.forEach((voice, idx) => {
         const node = document.createElement("div");
         node.className = "voice-node";
-        node.dataset.voiceId = voice.id;
-        node.title = `${voice.name} — ${voice.description || ""}`;
+        node.dataset.voiceName = voice.name;
+        node.title = `${voice.name} — ${voice.description}`;
 
-        const img = createAvatarElement(voice, 52);
+        const img = createAvatarElement(voice, isMobile ? 46 : 54);
         node.appendChild(img);
 
         const angle = (idx / total) * 2 * Math.PI - Math.PI / 2;
         node.style.transform = `translate(${Math.cos(angle) * radius}px, ${Math.sin(angle) * radius}px)`;
-        node.addEventListener("click", () => selectVoice(voice.id));
+        node.addEventListener("click", () => selectVoice(voice.name));
         elVoiceNodes.appendChild(node);
     });
 }
 
-function selectVoice(voiceId) {
-    activeVoiceId  = voiceId;
-    activeVoiceObj = voices.find(v => v.id === voiceId);
+window.addEventListener("resize", () => {
+    if (voices && voices.length > 0) {
+        renderVoiceCircle();
+    }
+});
+
+function selectVoice(voiceName) {
+    activeVoiceName = voiceName;
+    activeVoiceObj  = voices.find(v => v.name.toLowerCase() === voiceName.toLowerCase());
 
     elVoiceNodes.querySelectorAll(".voice-node").forEach(n => {
-        n.classList.toggle("selected", n.dataset.voiceId === voiceId);
+        n.classList.toggle("selected", n.dataset.voiceName.toLowerCase() === voiceName.toLowerCase());
     });
 
     if (!activeVoiceObj) return;
 
     elActiveAvatarWrap.innerHTML = "";
     const bigImg = createAvatarElement(activeVoiceObj, 56);
-    bigImg.className = "active-avatar";
     elActiveAvatarWrap.appendChild(bigImg);
 
     elActiveVoiceName.textContent = activeVoiceObj.name;
-    elActiveVoiceRole.textContent = activeVoiceObj.description || "";
-    elActiveVoiceDesc.textContent = `${activeVoiceObj.gender} · ${activeVoiceObj.supported_languages}`;
-    elOrbStatus.textContent       = `Ready · ${activeVoiceObj.name}`;
-    console.log(`[Voice] Selected: ${activeVoiceObj.name} (id=${voiceId})`);
+    elActiveVoiceRole.textContent = activeVoiceObj.description;
+    elActiveVoiceLangs.textContent = activeVoiceObj.supported_languages.replace(/,/g, " • ");
+    
+    // Set bio details
+    if (activeVoiceObj.name === "Sophia") {
+        elActiveVoiceDesc.textContent = "Warm, empathetic and conversational voice suitable for healthcare and patient coordination.";
+    } else if (activeVoiceObj.name === "Maya") {
+        elActiveVoiceDesc.textContent = "Energetic, bright and engaging female voice, great for sales recommendations and active client conversions.";
+    } else if (activeVoiceObj.name === "Ananya") {
+        elActiveVoiceDesc.textContent = "Clear, articulate support persona speaking naturally with a pleasant customer-first attitude.";
+    } else if (activeVoiceObj.name === "Arjun") {
+        elActiveVoiceDesc.textContent = "Steady, authoritative and reassuring male assistant, perfect for real estate catalog assistance.";
+    } else if (activeVoiceObj.name === "David") {
+        elActiveVoiceDesc.textContent = "Confident, persuasive and highly articulate male sales agent specialized in luxury properties.";
+    }
+
+    elOrbStatus.textContent = `Ready`;
+    updateStatusBadgeClass("status-ready");
+}
+
+function autoAdaptVoicesForLangAndIndustry() {
+    const currentLang = elLanguage.value;
+    // Sophia and Arjun support all 3 languages. Ananya/Maya support EN/TE, David supports EN only.
+    // If the active voice does not support the selected language, auto-adapt to Sophia or Arjun.
+    if (activeVoiceObj && !activeVoiceObj.supported_languages.includes(currentLang)) {
+        const fallback = currentLang === "Telugu" ? "Ananya" : (currentLang === "Hindi" ? "Sophia" : "Sophia");
+        console.log(`[Auto-Adapt] Active voice ${activeVoiceObj.name} does not support ${currentLang}. Swapping to ${fallback}.`);
+        selectVoice(fallback);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Session Lifecycle
-// ─────────────────────────────────────────────────────────────────────────────
-async function startConversation() {
-    if (connectionState !== "disconnected") {
-        console.warn("[Start] Already connecting/connected, ignoring.");
-        return;
-    }
-    if (!activeVoiceId) {
-        alert("Please select a voice profile first.");
-        return;
-    }
-
-    await ensureAudioContexts();
-
-    connectionState = "connecting";
-    elStartBtn.disabled = true;
-    elStartBtn.classList.add("hidden");
-    elEndBtn.classList.remove("hidden");
-    elCallMetrics.classList.remove("hidden");
-    if (elTelemetryPanel) elTelemetryPanel.classList.remove("hidden");
-    elStatus.textContent = "Setting up…";
-    elStatus.className   = "metric-value";
-    setOrbState(CallState.CONNECTED, "Setting up…");
-
-    if (elTranscriptScroll) elTranscriptScroll.innerHTML = "";
-    if (elEmptyMsg)   elEmptyMsg.classList.remove("hidden");
-    if (elTabSummary) elTabSummary.disabled = true;
-    if (elTabTranscript) switchTab("transcript");
-
-    try {
-        console.log("[Session] Creating session...");
-        const sessionRes = await fetch(`${API_BASE}/api/v1/voice-demo/sessions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                voice_profile_id: activeVoiceId,
-                industry: elIndustry.value,
-                language: elLanguage.value
-            })
-        });
-
-        if (!sessionRes.ok) {
-            const errText = await sessionRes.text();
-            throw new Error(`Session creation failed (${sessionRes.status}): ${errText}`);
-        }
-
-        const sessionData = await sessionRes.json();
-        sessionId = sessionData.session_id;
-        console.log(`[Session] Created: ${sessionId}`);
-
-        if (sessionData.voice_profile && sessionData.voice_profile.id !== activeVoiceId) {
-            selectVoice(sessionData.voice_profile.id);
-            appendSystemMessage(`Voice auto-adapted to ${sessionData.voice_profile.name} (language compatibility)`);
-        }
-
-        console.log("[Mic] Requesting microphone access...");
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl:  true,
-                channelCount: 1
-            }
-        });
-        console.log("[Mic] Access granted.");
-
-        wsClosedByUs = false;
-        const wsUrl = `${WS_BASE}/api/v1/voice-demo/stream/${sessionId}`;
-        console.log(`[WS] Connecting to: ${wsUrl}`);
-        websocket = new WebSocket(wsUrl);
-        websocket.binaryType = "arraybuffer";
-
-        websocket.onopen = () => {
-            console.log("[WS] Connected.");
-            connectionState = "connected";
-            elStatus.textContent = "Connected";
-            elStatus.style.color = "var(--listening-color)";
-            startTimer();
-            setupAudioCapture();
-            startKeepalive();
-        };
-
-        websocket.onmessage = handleWsMessage;
-
-        websocket.onerror = (e) => {
-            console.error("[WS] Error event:", e);
-            setOrbState(CallState.ERROR, "Connection Error");
-        };
-
-        websocket.onclose = (evt) => {
-            console.log(`[WS] Closed (code=${evt.code}, wasClean=${evt.wasClean}, byUs=${wsClosedByUs})`);
-            stopKeepalive();
-            if (!wsClosedByUs) {
-                let errMsg = "Connection closed unexpectedly.";
-                if (evt.code === 1006) {
-                    errMsg = "Connection lost (Code 1006) — server may have crashed or idle timeout hit.";
-                }
-                appendSystemMessage(errMsg);
-                setOrbState(CallState.ERROR, "Failed");
-                stopAllAudio();
-                stopTimer();
-                teardownAudioCapture();
-
-                elStatus.textContent = "Error";
-                elStatus.style.color = "var(--error-color)";
-                if (elTabSummary) {
-                    elTabSummary.disabled = false;
-                    fetchSummary();
-                }
-                resetUIAfterCall();
-            }
-        };
-
-    } catch (err) {
-        console.error("[Start] Error:", err);
-        setOrbState(CallState.ERROR, "Failed");
-        elStatus.textContent = "Error";
-        appendSystemMessage(`Error: ${err.message}`);
-        resetUIAfterCall();
-    }
-}
-
-async function stopConversation() {
-    if (connectionState === "disconnected") return;
-    console.log("[Stop] Stopping conversation...");
-
-    connectionState = "disconnected";
-    setOrbState(CallState.CALL_COMPLETED, "Call Ended");
-    stopAllAudio();
-    stopTimer();
-    stopKeepalive();
-
-    if (websocket && websocket.readyState < WebSocket.CLOSING) {
-        wsClosedByUs = true;
-        try { websocket.send(JSON.stringify({ event: "stop" })); } catch (_) {}
-        websocket.close(1000, "User ended session");
-    }
-    websocket = null;
-
-    teardownAudioCapture();
-
-    elStatus.textContent = "Ended";
-    elStatus.style.color = "";
-
-    if (elTabSummary) {
-        elTabSummary.disabled = false;
-        await fetchSummary();
-    }
-    resetUIAfterCall();
-}
-
-function teardownAudioCapture() {
-    if (workletNode) {
-        try { workletNode.port.postMessage({ type: "stop" }); } catch (_) {}
-        try { workletNode.disconnect(); } catch (_) {}
-        workletNode = null;
-    }
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(t => t.stop());
-        mediaStream = null;
-    }
-}
-
-function resetUIAfterCall() {
-    elStartBtn.disabled = false;
-    elStartBtn.classList.remove("hidden");
-    elEndBtn.classList.add("hidden");
-    isMuted = false;
-    elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone"></i>`;
-    elMuteBtn.classList.remove("muted");
-    elMicStatus.textContent = "Active";
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Audio Context & Capture
+// Audio Capture & Playout Setup
 // ─────────────────────────────────────────────────────────────────────────────
 async function ensureAudioContexts() {
     if (!captureContext) {
         captureContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
-        console.log(`[Audio] Capture AudioContext created (sampleRate=${captureContext.sampleRate})`);
     }
     if (captureContext.state === "suspended") {
         await captureContext.resume();
@@ -469,7 +320,6 @@ async function ensureAudioContexts() {
 
     if (!playbackContext) {
         playbackContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
-        console.log(`[Audio] Playback AudioContext created (sampleRate=${playbackContext.sampleRate})`);
     }
     if (playbackContext.state === "suspended") {
         await playbackContext.resume();
@@ -494,6 +344,10 @@ async function setupAudioCapture() {
             if (!evt.data || evt.data.type !== "frame") return;
             if (!websocket || websocket.readyState !== WebSocket.OPEN || isMuted) return;
 
+            // BUG 1 FIX: Gate mic transmission while AI is speaking or in protection window.
+            // This is the primary defence against speaker audio leaking into STT.
+            if (isAiSpeaking || performance.now() < speakerProtectionUntil) return;
+
             const float32 = evt.data.data;
             const downsampled = downsample(float32, captureContext.sampleRate, 8000);
             const int16 = float32ToInt16PCM(downsampled);
@@ -501,16 +355,17 @@ async function setupAudioCapture() {
         };
 
         sourceNode.connect(workletNode);
-        console.log("[Audio] Capture pipeline active (AudioWorkletNode).");
+        console.log("[Audio] Capture worklet connected.");
 
     } catch (err) {
-        console.warn(`[Audio] AudioWorklet failed (${err.message}), falling back to ScriptProcessorNode.`);
-
+        console.warn(`[Audio] AudioWorklet failed (${err.message}), falling back to ScriptProcessor.`);
         const sourceNode = captureContext.createMediaStreamSource(mediaStream);
         const scriptProcessor = captureContext.createScriptProcessor(4096, 1, 1);
 
         scriptProcessor.onaudioprocess = (evt) => {
             if (!websocket || websocket.readyState !== WebSocket.OPEN || isMuted) return;
+            // BUG 1 FIX: Same gate for ScriptProcessor fallback path.
+            if (isAiSpeaking || performance.now() < speakerProtectionUntil) return;
             const float32 = evt.inputBuffer.getChannelData(0);
             const downsampled = downsample(float32, captureContext.sampleRate, 8000);
             const int16 = float32ToInt16PCM(downsampled);
@@ -519,7 +374,18 @@ async function setupAudioCapture() {
 
         sourceNode.connect(scriptProcessor);
         scriptProcessor.connect(captureContext.destination);
-        console.log("[Audio] Capture pipeline active (ScriptProcessorNode fallback).");
+    }
+}
+
+function teardownAudioCapture() {
+    if (workletNode) {
+        try { workletNode.port.postMessage({ type: "stop" }); } catch (_) {}
+        try { workletNode.disconnect(); } catch (_) {}
+        workletNode = null;
+    }
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
     }
 }
 
@@ -548,8 +414,136 @@ function float32ToInt16PCM(buf) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Keepalive
+// Session Lifecycle Handlers
 // ─────────────────────────────────────────────────────────────────────────────
+async function startConversation() {
+    if (connectionState !== "disconnected") return;
+
+    await ensureAudioContexts();
+
+    connectionState = "connecting";
+    elStartBtn.disabled = true;
+    elStartBtn.classList.add("hidden");
+    elEndBtn.classList.remove("hidden");
+    
+    elMuteBtn.disabled = false;
+    elMicIndicator.classList.add("recording");
+    elMicStatus.textContent = "Active";
+
+    setOrbState(CallState.CONNECTED, "Connecting...");
+
+    try {
+        const res = await fetch(`${API_BASE}/api/v1/voice-demo/sessions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                voice_name: activeVoiceName,
+                industry: elIndustry.value,
+                language: elLanguage.value
+            })
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`Session creation failed: ${errText}`);
+        }
+
+        const sessionData = await res.json();
+        sessionId = sessionData.session_id;
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl:  true,
+                channelCount: 1
+            }
+        });
+
+        wsClosedByUs = false;
+        const wsUrl = `${WS_BASE}/api/v1/voice-demo/stream/${sessionId}`;
+        websocket = new WebSocket(wsUrl);
+        websocket.binaryType = "arraybuffer";
+
+        websocket.onopen = () => {
+            connectionState = "connected";
+            setOrbState(CallState.WAITING_FOR_CUSTOMER);
+            setupAudioCapture();
+            startKeepalive();
+        };
+
+        websocket.onmessage = handleWsMessage;
+
+        websocket.onerror = (e) => {
+            console.error("[WS] Connection error:", e);
+            setOrbState(CallState.ERROR, "Connection Error");
+        };
+
+        websocket.onclose = (evt) => {
+            stopKeepalive();
+            if (!wsClosedByUs) {
+                setOrbState(CallState.ERROR, "Disconnected");
+                stopAllAudio();
+                teardownAudioCapture();
+                resetUIAfterCall();
+                elThankYouModal.classList.remove("hidden");
+            }
+        };
+
+    } catch (err) {
+        console.error("[Start] Error starting conversation:", err);
+        setOrbState(CallState.ERROR, "Start Failed");
+        resetUIAfterCall();
+    }
+}
+
+async function stopConversation() {
+    if (connectionState === "disconnected") return;
+    connectionState = "disconnected";
+
+    setOrbState(CallState.CALL_COMPLETED, "Conversation Ended");
+    stopAllAudio();
+    stopKeepalive();
+
+    if (websocket && websocket.readyState < WebSocket.CLOSING) {
+        wsClosedByUs = true;
+        try { websocket.send(JSON.stringify({ event: "stop" })); } catch (_) {}
+        websocket.close(1000, "User ended call");
+    }
+    websocket = null;
+    teardownAudioCapture();
+    resetUIAfterCall();
+
+    // Trigger Thank You modal
+    elThankYouModal.classList.remove("hidden");
+}
+
+function resetUIAfterCall() {
+    elStartBtn.disabled = false;
+    elStartBtn.classList.remove("hidden");
+    elEndBtn.classList.add("hidden");
+    
+    elMuteBtn.disabled = true;
+    elMuteBtn.classList.remove("muted");
+    elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone"></i>`;
+    elMicIndicator.classList.remove("recording");
+    elMicStatus.textContent = "Ready";
+    isMuted = false;
+}
+
+function toggleMute() {
+    isMuted = !isMuted;
+    if (isMuted) {
+        elMuteBtn.classList.add("muted");
+        elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone-slash"></i>`;
+        elMicStatus.textContent = "Muted";
+    } else {
+        elMuteBtn.classList.remove("muted");
+        elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone"></i>`;
+        elMicStatus.textContent = "Active";
+    }
+}
+
 function startKeepalive() {
     stopKeepalive();
     pingInterval = setInterval(() => {
@@ -567,7 +561,7 @@ function stopKeepalive() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Audio Playback
+// Playout and Audio Output Queue
 // ─────────────────────────────────────────────────────────────────────────────
 function decodeUlaw(u) {
     u = (~u) & 0xFF;
@@ -595,7 +589,9 @@ function playMulaw(arrayBuffer) {
     src.connect(playbackContext.destination);
 
     const now = playbackContext.currentTime;
-    if (nextPlayTime < now + 0.02) nextPlayTime = now + 0.02;
+    if (nextPlayTime < now + 0.02) {
+        nextPlayTime = now + 0.05; // 50ms safety lookahead jitter buffer
+    }
     src.start(nextPlayTime);
     nextPlayTime += buf.duration;
 
@@ -610,11 +606,11 @@ function stopAllAudio() {
     activeSources.forEach(src => { try { src.stop(); } catch (_) {} });
     activeSources = [];
     nextPlayTime  = 0;
-    console.log("[Audio] All playback stopped.");
+    console.log("[Audio] All audio playback stopped.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Message Handler & Telemetry
+// WebSocket Routing
 // ─────────────────────────────────────────────────────────────────────────────
 function handleWsMessage(evt) {
     if (evt.data instanceof ArrayBuffer) {
@@ -623,333 +619,89 @@ function handleWsMessage(evt) {
     }
     try {
         const msg = JSON.parse(evt.data);
+        if (msg.event === "state_change") {
+            const newState = msg.state;
 
-        switch (msg.event) {
-            case "state_change":
-                setOrbState(msg.state);
-                break;
-            case "clear_audio":
-                stopAllAudio();
-                break;
-            case "transcript":
-                appendTranscript(msg.sender, msg.text, msg.timestamp, msg.intermediate);
-                break;
-            case "metrics":
-                updateTelemetryMetrics(msg.metrics);
-                break;
-            case "startup_metrics":
-                console.log("[Startup Telemetry]", msg.metrics);
-                break;
-            case "pong":
-                break;
-            default:
-                console.warn("[WS] Unknown event:", msg.event);
+            // BUG 1 FIX: Track AI speaking state to gate microphone transmission.
+            if (newState === CallState.AI_SPEAKING) {
+                isAiSpeaking = true;
+                speakerProtectionUntil = 0;  // reset; will be set when AI stops
+                console.log("[Echo-ISO] AI speaking — mic gated OFF");
+            } else if (isAiSpeaking) {
+                // AI just stopped speaking — engage protection window
+                isAiSpeaking = false;
+                speakerProtectionUntil = performance.now() + SPEAKER_PROTECTION_MS;
+                console.log(`[Echo-ISO] AI stopped — mic gated for ${SPEAKER_PROTECTION_MS}ms`);
+            }
+
+            setOrbState(newState);
+        } else if (msg.event === "clear_audio") {
+            stopAllAudio();
+            // Also reset protection window on barge-in clear
+            isAiSpeaking = false;
+            speakerProtectionUntil = 0;
         }
     } catch (e) {
-        console.error("[WS] Failed to parse control message:", e, evt.data);
+        console.error("[WS] Fail to parse control packet:", e);
     }
 }
 
-function updateTelemetryMetrics(metrics) {
-    if (!metrics) return;
-    if (elTeleRoundtrip && metrics.total_round_trip_ms != null) {
-        elTeleRoundtrip.textContent = `${metrics.total_round_trip_ms} ms`;
-    }
-    if (elTeleLlm && metrics.llm_latency_ms != null) {
-        elTeleLlm.textContent = `${metrics.llm_latency_ms} ms`;
-    }
-    if (elTeleTts && metrics.tts_first_byte_ms != null) {
-        elTeleTts.textContent = `${metrics.tts_first_byte_ms} ms`;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Orb State Visuals
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Update UI Orb State ─────────────────────────────────────────────────────
 function setOrbState(state, customLabel) {
     elOrb.className = "orb-pulsar";
-    let label       = customLabel;
-    let showThinking = false;
+    let label = customLabel;
+    let badgeClass = "status-ready";
 
     switch (state) {
         case CallState.CONNECTED:
             elOrb.classList.add("state-idle");
             label = label || "Connected";
+            badgeClass = "status-connected";
             break;
         case CallState.WAITING_FOR_CUSTOMER:
             elOrb.classList.add("state-idle");
-            label = "Listening…";
+            label = "Listening";
+            badgeClass = "status-listening";
             break;
         case CallState.CUSTOMER_SPEAKING:
             elOrb.classList.add("state-listening");
-            label = "You're speaking";
+            label = "Listening";
+            badgeClass = "status-listening";
             break;
         case CallState.TRANSCRIBING:
-            elOrb.classList.add("state-thinking");
-            label = "Transcribing…";
-            showThinking = true;
-            break;
         case CallState.THINKING:
-            elOrb.classList.add("state-thinking");
-            label = "AI thinking…";
-            showThinking = true;
-            break;
         case CallState.GENERATING_RESPONSE:
             elOrb.classList.add("state-thinking");
-            label = "Generating…";
-            showThinking = true;
+            label = "Thinking";
+            badgeClass = "status-thinking";
             break;
         case CallState.AI_SPEAKING:
             elOrb.classList.add("state-speaking");
-            label = "AI speaking";
+            label = "Speaking";
+            badgeClass = "status-speaking";
             break;
         case CallState.CALL_COMPLETED:
             elOrb.classList.add("state-disconnected");
-            label = "Call ended";
+            label = "Call Ended";
+            badgeClass = "status-ready";
             break;
         case CallState.ERROR:
             elOrb.classList.add("state-error");
-            label = "Error";
+            label = label || "Error";
+            badgeClass = "status-error";
             break;
         default:
             elOrb.classList.add("state-idle");
             label = label || state;
+            badgeClass = "status-ready";
     }
 
     if (elOrbStatus) elOrbStatus.textContent = label;
-    if (elTypingIndicator) {
-        if (showThinking) {
-            elTypingIndicator.classList.remove("hidden");
-        } else {
-            elTypingIndicator.classList.add("hidden");
-        }
-    }
+    updateStatusBadgeClass(badgeClass);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Transcript Rendering (with Live Intermediate STT support)
-// ─────────────────────────────────────────────────────────────────────────────
-function appendTranscript(sender, text, timestamp, isIntermediate) {
-    if (!elTranscriptScroll) return;
-    if (elEmptyMsg) elEmptyMsg.classList.add("hidden");
-
-    const isUser = sender === "user";
-
-    // Handle intermediate live STT transcript updates
-    if (isUser && isIntermediate) {
-        let interMsg = elTranscriptScroll.querySelector(".dialog-msg.intermediate-user");
-        if (!interMsg) {
-            interMsg = document.createElement("div");
-            interMsg.className = "dialog-msg user intermediate-user";
-
-            const senderEl = document.createElement("span");
-            senderEl.className = "msg-sender";
-            senderEl.textContent = "You (speaking...)";
-
-            const bubble = document.createElement("div");
-            bubble.className = "msg-bubble";
-            bubble.style.opacity = "0.75";
-            bubble.style.fontStyle = "italic";
-
-            const timeEl = document.createElement("span");
-            timeEl.className = "msg-time";
-            timeEl.textContent = "Live";
-
-            interMsg.appendChild(senderEl);
-            interMsg.appendChild(bubble);
-            interMsg.appendChild(timeEl);
-
-            elTranscriptScroll.appendChild(interMsg);
-        }
-
-        const bubble = interMsg.querySelector(".msg-bubble");
-        if (bubble) bubble.textContent = text;
-        elTranscriptScroll.scrollTop = elTranscriptScroll.scrollHeight;
-        return;
-    }
-
-    // Remove intermediate message node if final transcript arrives
-    if (isUser && !isIntermediate) {
-        const interMsg = elTranscriptScroll.querySelector(".dialog-msg.intermediate-user");
-        if (interMsg) {
-            interMsg.remove();
-        }
-    }
-
-    const div = document.createElement("div");
-    div.className = `dialog-msg ${isUser ? "user" : "agent"}`;
-
-    const date    = timestamp ? new Date(timestamp) : new Date();
-    const timeStr = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-    const senderEl = document.createElement("span");
-    senderEl.className   = "msg-sender";
-    senderEl.textContent = isUser ? "You" : "AI Agent";
-
-    const bubble = document.createElement("div");
-    bubble.className   = "msg-bubble";
-    bubble.textContent = text;
-
-    const timeEl = document.createElement("span");
-    timeEl.className   = "msg-time";
-    timeEl.textContent = timeStr;
-
-    div.appendChild(senderEl);
-    div.appendChild(bubble);
-    div.appendChild(timeEl);
-
-    elTranscriptScroll.appendChild(div);
-    elTranscriptScroll.scrollTop = elTranscriptScroll.scrollHeight;
-}
-
-function appendSystemMessage(text) {
-    if (!elTranscriptScroll) { console.info(`[System] ${text}`); return; }
-    if (elEmptyMsg) elEmptyMsg.classList.add("hidden");
-
-    const div = document.createElement("div");
-    div.className = "system-msg";
-    div.innerHTML = `<i class="fa-solid fa-circle-info"></i> <span>${escapeHtml(text)}</span>`;
-    elTranscriptScroll.appendChild(div);
-    elTranscriptScroll.scrollTop = elTranscriptScroll.scrollHeight;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Summary
-// ─────────────────────────────────────────────────────────────────────────────
-async function fetchSummary() {
-    if (!sessionId) return;
-    switchTab("summary");
-
-    elSummaryScroll.innerHTML = "";
-    const loadingEl = document.createElement("div");
-    loadingEl.className = "empty-transcript-message";
-    loadingEl.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i><p>Analyzing conversation…</p>`;
-    elSummaryScroll.appendChild(loadingEl);
-
-    try {
-        console.log(`[Summary] Fetching summary for session ${sessionId}...`);
-        const res = await fetch(`${API_BASE}/api/v1/voice-demo/summary/${sessionId}`, { method: "POST" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        console.log("[Summary] Received:", data);
-        renderSummary(data);
-    } catch (err) {
-        console.error("[Summary] Failed:", err);
-        elSummaryScroll.innerHTML = "";
-        const errEl = document.createElement("div");
-        errEl.className = "empty-transcript-message";
-        errEl.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><p>Failed to generate summary: ${escapeHtml(err.message)}</p>`;
-        elSummaryScroll.appendChild(errEl);
-    }
-}
-
-function renderSummary(data) {
-    const extracted = data.extracted_information || {};
-    const extractedRows = Object.entries(extracted)
-        .filter(([, v]) => v)
-        .map(([k, v]) => `<div class="info-item"><label>${escapeHtml(k.replace(/_/g, " "))}</label><span>${escapeHtml(String(v))}</span></div>`)
-        .join("") || `<div class="info-item"><span style="color:var(--text-secondary)">No entities captured</span></div>`;
-
-    const knowledge = data.knowledge_retrieved || [];
-    const knowledgeHtml = knowledge.length
-        ? `<ul class="summary-list">${knowledge.map(k => `<li>${escapeHtml(k)}</li>`).join("")}</ul>`
-        : `<p style="color:var(--text-secondary);font-size:0.85rem">No RAG facts retrieved</p>`;
-
-    elSummaryScroll.innerHTML = `
-        <div class="metric-grid">
-            <div class="metric-card">
-                <label><i class="fa-solid fa-bullseye"></i> Intent</label>
-                <span>${escapeHtml(data.intent || "—")}</span>
-            </div>
-            <div class="metric-card">
-                <label><i class="fa-solid fa-face-smile"></i> Sentiment</label>
-                <span>${escapeHtml(data.sentiment || "—")}</span>
-            </div>
-            <div class="metric-card">
-                <label><i class="fa-solid fa-clock"></i> Duration</label>
-                <span>${formatTime(data.duration_seconds || 0)}</span>
-            </div>
-            <div class="metric-card">
-                <label><i class="fa-solid fa-id-card"></i> Lead Rating</label>
-                <span>${escapeHtml(data.lead_qualification || "—")}</span>
-            </div>
-            <div class="metric-card wide">
-                <label><i class="fa-solid fa-calendar-check"></i> Appointment Status</label>
-                <span>${escapeHtml(data.appointment_status || "—")}</span>
-            </div>
-        </div>
-        <div class="summary-card">
-            <h4>Conversation Summary</h4>
-            <p>${escapeHtml(data.summary || "No summary available.")}</p>
-        </div>
-        <div class="summary-card">
-            <h4>Extracted Information</h4>
-            <div class="info-list">${extractedRows}</div>
-        </div>
-        <div class="summary-card">
-            <h4>RAG Knowledge Retrieved</h4>
-            ${knowledgeHtml}
-        </div>
-        <div class="summary-card">
-            <h4>Recommended Next Action</h4>
-            <p>${escapeHtml(data.recommended_next_action || "No recommendation.")}</p>
-        </div>
-    `;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UI Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-function toggleMute() {
-    isMuted = !isMuted;
-    if (isMuted) {
-        elMuteBtn.classList.add("muted");
-        elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone-slash"></i>`;
-        elMicStatus.textContent = "Muted";
-    } else {
-        elMuteBtn.classList.remove("muted");
-        elMuteBtn.innerHTML = `<i class="fa-solid fa-microphone"></i>`;
-        elMicStatus.textContent = "Active";
-    }
-}
-
-function startTimer() {
-    stopTimer();
-    callDurationSeconds = 0;
-    elTimer.textContent = "00:00";
-    callTimerInterval = setInterval(() => {
-        callDurationSeconds++;
-        elTimer.textContent = formatTime(callDurationSeconds);
-    }, 1000);
-}
-
-function stopTimer() {
-    if (callTimerInterval) {
-        clearInterval(callTimerInterval);
-        callTimerInterval = null;
-    }
-}
-
-function formatTime(secs) {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-function switchTab(tab) {
-    if (!elTabTranscript || !elTabSummary) return;
-    const isTranscript = tab === "transcript";
-    elTabTranscript.classList.toggle("active", isTranscript);
-    elTabSummary.classList.toggle("active", !isTranscript);
-    if (elTranscriptContent) elTranscriptContent.classList.toggle("hidden", !isTranscript);
-    if (elSummaryContent)    elSummaryContent.classList.toggle("hidden", isTranscript);
-}
-
-function escapeHtml(str) {
-    return String(str)
-        .replace(/&/g,  "&amp;")
-        .replace(/</g,  "&lt;")
-        .replace(/>/g,  "&gt;")
-        .replace(/"/g,  "&quot;")
-        .replace(/'/g,  "&#039;");
+function updateStatusBadgeClass(badgeClass) {
+    if (!elOrbStatus) return;
+    elOrbStatus.className = "status-badge";
+    elOrbStatus.classList.add(badgeClass);
 }

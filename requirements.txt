@@ -52,3 +52,8 @@ sentence-transformers>=2.5.0
 torch>=2.2.0
 torchaudio>=2.2.0
 numpy>=1.22.4
+
+# Kokoro TTS dependencies
+kokoro-onnx>=0.3.0
+onnxruntime>=1.16.0
+

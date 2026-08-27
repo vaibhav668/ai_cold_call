@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
     ffmpeg \
+    espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy venv from builder

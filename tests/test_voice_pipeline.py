@@ -10,7 +10,7 @@ from app.models.campaign import Campaign
 from app.models.customer import Customer
 from app.models.prompt_template import PromptTemplate
 from app.models.user import User
-from app.services.vad_service import VADService, decode_ulaw_sample
+from app.services.vad_service import VADService
 
 test_user_id = "22222222-2222-2222-2222-222222222222"
 mock_admin_user = User(id=test_user_id, email="admin@example.com", role="admin", is_active=True)
@@ -137,6 +137,11 @@ def test_streaming_interruption_via_websocket(override_auth, monkeypatch):
     async def mock_transcribe(self, audio_bytes, language=None):
         return "hello reschedule please"
     monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_transcribe)
+
+    from app.services.llm_service import LLMManager
+    async def mock_generate_stream(self, messages, tools=None):
+        yield "Hello! I can help you with your appointment.", None
+    monkeypatch.setattr(LLMManager, "generate_completion_stream", mock_generate_stream)
 
     with client.websocket_connect(f"/api/v1/telephony/stream/{call_id}") as ws:
         # Start connection

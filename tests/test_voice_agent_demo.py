@@ -218,6 +218,11 @@ async def test_websocket_stream_integration(override_auth, monkeypatch):
     monkeypatch.setattr(FasterWhisperProvider, "transcribe_utterance", mock_transcribe)
 
     with client.websocket_connect(f"/api/v1/voice-demo/stream/{session_id}") as ws:
+        # Receive the initial startup_metrics message sent immediately upon connection
+        startup_reply = ws.receive_text()
+        startup_data = json.loads(startup_reply)
+        assert startup_data["event"] == "startup_metrics"
+
         # Send raw 320 bytes Float32 downsampled PCM dummy frame (all zeros)
         ws.send_bytes(b"\x00" * 320)
         
@@ -255,7 +260,7 @@ async def test_get_session_summary_success(client: AsyncClient, override_auth):
         "start_time": time.time() - 30,
         "end_time": time.time(),
         "transcript": [
-            {"sender": "agent", "text": "Hello Vaibhav.", "timestamp": datetime.utcnow().isoformat()},
+            {"sender": "agent", "text": "Hello Amit.", "timestamp": datetime.utcnow().isoformat()},
             {"sender": "user", "text": "Yes hello Sophia.", "timestamp": datetime.utcnow().isoformat()}
         ]
     }

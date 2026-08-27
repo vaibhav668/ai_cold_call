@@ -6,27 +6,28 @@ from pydantic import BaseModel, ConfigDict
 class VoiceProfileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: uuid.UUID
+    id: Optional[uuid.UUID] = None
     name: str
     description: Optional[str] = None
     avatar: Optional[str] = None
     gender: str
     supported_languages: str
-    voice_provider: str
+    voice_provider: Optional[str] = None
     preview_audio: Optional[str] = None
     status: str
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
 class SessionSetupIn(BaseModel):
-    voice_profile_id: uuid.UUID
+    voice_profile_id: Optional[uuid.UUID] = None
+    voice_name: Optional[str] = None
     industry: str  # "hospital" or "real_estate"
     language: str  # "English", "Hindi", or "Telugu"
 
 class SessionSetupOut(BaseModel):
     session_id: str
     campaign_id: uuid.UUID
-    customer_id: uuid.UUID
+    customer_id: Optional[uuid.UUID] = None
     voice_profile: VoiceProfileOut
 
 class MessageExchange(BaseModel):

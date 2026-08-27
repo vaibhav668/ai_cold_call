@@ -1,6 +1,6 @@
 import pytest
 import httpx
-from typing import Tuple, Optional, List, Dict, Any
+from typing import Tuple, Optional, List, Dict, Any, AsyncGenerator
 from app.services.llm_service import LLMManager, BaseLLMProvider, GroqProvider, OpenRouterProvider
 
 class MockSuccessProvider(BaseLLMProvider):
@@ -16,6 +16,15 @@ class MockSuccessProvider(BaseLLMProvider):
         self.called = True
         return self.response_text, None
 
+    async def generate_completion_stream(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> AsyncGenerator[Tuple[Optional[str], Optional[List[Dict[str, Any]]]], None]:
+        self.called = True
+        yield self.response_text, None
+
+
 class MockFailureProvider(BaseLLMProvider):
     async def generate_completion(
         self,
@@ -23,6 +32,15 @@ class MockFailureProvider(BaseLLMProvider):
         tools: Optional[List[Dict[str, Any]]] = None
     ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
         raise httpx.ConnectError("Failed to connect to primary LLM backend.")
+
+    async def generate_completion_stream(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> AsyncGenerator[Tuple[Optional[str], Optional[List[Dict[str, Any]]]], None]:
+        raise httpx.ConnectError("Failed to connect to primary LLM backend.")
+        # Need a yield to make it an async generator
+        yield None
 
 @pytest.mark.anyio
 async def test_llm_manager_primary_success(monkeypatch):

@@ -31,3 +31,4 @@ htmlcov/
 /qdrant_data/
 /data/
 /chroma_db_data/
+/models/
